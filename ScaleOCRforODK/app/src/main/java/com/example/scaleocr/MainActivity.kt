@@ -1,6 +1,7 @@
 package com.example.scaleocr
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.Gravity
@@ -118,7 +119,7 @@ class MainActivity : AppCompatActivity() {
                                 } else {
                                     candidate = null
                                     detected.text = "— — —"
-                                    status.text = "لم أتعرف على وزن بصيغة 00.000 بعد"
+                                    status.text = "لم أتعرف على رقم وزن واضح؛ وجّه الكاميرا نحو الشاشة."
                                     confirm.isEnabled = false
                                 }
                             }
@@ -141,19 +142,23 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // Accept exactly three decimal digits. Normalize comma to dot, then validate a decimal range.
+    // Accept one to three decimal digits and normalize to three without changing the value.
+    // Examples: 53.4 -> 53.400, 53.45 -> 53.450, 12,650 -> 12.650.
     private fun extractWeight(text: String): String? {
-        val normalized = text.replace(',', '.')
-        val pattern = Pattern.compile("(?<![0-9])[0-9]{1,6}\\.[0-9]{3}(?![0-9])")
-        val matcher = pattern.matcher(normalized)
+        val pattern = Pattern.compile("(?<![0-9])([0-9]{1,6})[.,]([0-9]{1,3})(?![0-9])")
+        val matcher = pattern.matcher(text)
         if (!matcher.find()) return null
-        val value = matcher.group()
-        return value?.takeIf { it.toDoubleOrNull() != null }
+
+        val whole = matcher.group(1) ?: return null
+        val fraction = matcher.group(2) ?: return null
+        val value = whole + "." + fraction.padEnd(3, '0')
+        return value.takeIf { it.toDoubleOrNull() != null }
     }
 
     private fun returnValue() {
         val value = candidate ?: return
-        val result = intent.apply { putExtra("value", value) }
+        // ODK Collect reads a String extra named "value" from the result Intent.
+        val result = Intent().putExtra("value", value)
         setResult(RESULT_OK, result)
         finish()
     }
