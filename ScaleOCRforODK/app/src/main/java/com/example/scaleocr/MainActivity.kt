@@ -119,7 +119,7 @@ class MainActivity : AppCompatActivity() {
                                 } else {
                                     candidate = null
                                     detected.text = "— — —"
-                                    status.text = "لم أتعرف على رقم وزن واضح؛ وجّه الكاميرا نحو الشاشة."
+                                    status.text = "النص الذي قرأته الكاميرا: ${result.text.replace("\n", " | ")}"
                                     confirm.isEnabled = false
                                 }
                             }
