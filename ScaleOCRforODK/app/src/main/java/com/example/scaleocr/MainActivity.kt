@@ -270,7 +270,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // Extract weight and normalize it to three decimal places.
-     private fun extractWeight(text: String): String? {     val normalized = text         .replace('٫', '.')         .replace('،', '.')         .replace(',', '.')         .replace(Regex("\s+"), "")      val pattern = Regex(         "(?<![0-9])([0-9]{1,6})\.([0-9]{1,3})(?![0-9])"     )      val match = pattern.find(normalized) ?: return null      val whole = match.groupValues[1]     val fraction = match.groupValues[2]      return (whole + "." + fraction.padEnd(3, '0'))         .takeIf { it.toDoubleOrNull() != null } } {
+    private fun extractWeight(text: String): String? {
 
         val normalized = text
             .replace('٫', '.')
