@@ -144,7 +144,7 @@ class MainActivity : AppCompatActivity() {
 
     // Accept one to three decimal digits and normalize to three without changing the value.
     // Examples: 53.4 -> 53.400, 53.45 -> 53.450, 12,650 -> 12.650.
-    private fun extractWeight(text: String): String? {
+     private fun extractWeight(text: String): String? {     val normalized = text         .replace('٫', '.')         .replace('،', '.')         .replace(',', '.')         .replace(Regex("\s+"), "")      val pattern = Regex(         "(?<![0-9])([0-9]{1,6})\.([0-9]{1,3})(?![0-9])"     )      val match = pattern.find(normalized) ?: return null      val whole = match.groupValues[1]     val fraction = match.groupValues[2]      return (whole + "." + fraction.padEnd(3, '0'))         .takeIf { it.toDoubleOrNull() != null } } {
         val pattern = Pattern.compile("(?<![0-9])([0-9]{1,6})[.,]([0-9]{1,3})(?![0-9])")
         val matcher = pattern.matcher(text)
         if (!matcher.find()) return null
