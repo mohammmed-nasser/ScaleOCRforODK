@@ -20,6 +20,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.util.concurrent.ExecutorService
@@ -41,6 +42,11 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile
     private var candidate: String? = null
+
+    private var pendingCandidate: String? = null
+    private var stableCount = 0
+
+    private val requiredStableReads = 3
 
     private val cameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -202,23 +208,46 @@ class MainActivity : AppCompatActivity() {
 
                             .addOnSuccessListener { result ->
 
-                                val match = extractWeight(result.text)
+                                val match = extractWeight(result)
 
                                 runOnUiThread {
 
                                     if (match != null) {
 
-                                        candidate = match
+                                        if (match == pendingCandidate) {
+                                            stableCount++
+                                        } else {
+                                            pendingCandidate = match
+                                            stableCount = 1
+                                        }
+
                                         detected.text = match
 
-                                        status.text =
-                                            "تم التعرف على وزن محتمل. راجعه قبل الإرسال."
+                                        if (stableCount >= requiredStableReads) {
 
-                                        confirm.isEnabled = true
+                                            candidate = match
+
+                                            status.text =
+                                                "تم تثبيت قراءة الوزن. يمكنك التأكيد والإرسال."
+
+                                            confirm.isEnabled = true
+
+                                        } else {
+
+                                            candidate = null
+                                            confirm.isEnabled = false
+
+                                            status.text =
+                                                "جارٍ التأكد من القراءة: " +
+                                                "$stableCount/$requiredStableReads"
+                                        }
 
                                     } else {
 
                                         candidate = null
+                                        pendingCandidate = null
+                                        stableCount = 0
+
                                         detected.text = "— — —"
 
                                         status.text =
@@ -269,34 +298,53 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // Extract weight and normalize it to three decimal places.
-    private fun extractWeight(text: String): String? {
-
-        val normalized = text
-            .replace('٫', '.')
-            .replace('،', '.')
-            .replace(',', '.')
-            .map { char ->
-                when (char) {
-                    in '٠'..'٩' -> '0' + (char - '٠')
-                    in '۰'..'۹' -> '0' + (char - '۰')
-                    else -> char
-                }
-            }
-            .joinToString("")
-            .replace(Regex("\\s+"), "")
+    // Extract the largest visible decimal number from OCR lines.
+    private fun extractWeight(result: Text): String? {
 
         val pattern = Regex(
             "(?<![0-9])([0-9]{1,6})\\.([0-9]{1,3})(?![0-9])"
         )
 
-        val match = pattern.find(normalized) ?: return null
+        val candidates = result.textBlocks
+            .flatMap { block -> block.lines }
+            .mapNotNull { line ->
 
-        val whole = match.groupValues[1]
-        val fraction = match.groupValues[2]
+                val normalized = line.text
+                    .replace('٫', '.')
+                    .replace('،', '.')
+                    .replace(',', '.')
+                    .map { char ->
+                        when (char) {
+                            in '٠'..'٩' -> '0' + (char - '٠')
+                            in '۰'..'۹' -> '0' + (char - '۰')
+                            else -> char
+                        }
+                    }
+                    .joinToString("")
+                    .replace(Regex("\\s+"), "")
 
-        return (whole + "." + fraction.padEnd(3, '0'))
-            .takeIf { it.toDoubleOrNull() != null }
+                val match = pattern.find(normalized)
+                    ?: return@mapNotNull null
+
+                val whole = match.groupValues[1]
+                val fraction = match.groupValues[2]
+
+                val weight = (whole + "." + fraction.padEnd(3, '0'))
+                    .takeIf { it.toDoubleOrNull() != null }
+                    ?: return@mapNotNull null
+
+                val height = line.boundingBox?.height() ?: 0
+                val width = line.boundingBox?.width() ?: 0
+
+                Triple(weight, height, width)
+            }
+
+        return candidates
+            .maxWithOrNull(
+                compareBy<Triple<String, Int, Int>> { it.second }
+                    .thenBy { it.third }
+            )
+            ?.first
     }
 
     // Return recognized weight to ODK Collect.
