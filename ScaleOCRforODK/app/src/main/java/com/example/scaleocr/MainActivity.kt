@@ -1,6 +1,4 @@
-from pathlib import Path
-
-source = r'''package com.example.scaleocr
+package com.example.scaleocr
 
 import android.Manifest
 import android.content.Intent
@@ -28,9 +26,20 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
+/**
+ * قارئ وزن لشاشات LCD/LED ذات المقاطع السبعة.
+ *
+ * لا يعتمد على كون الإضاءة الخلفية خضراء أو مضاءة:
+ * 1) يستخدم قناة الإضاءة Y من صورة الكاميرا.
+ * 2) ينشئ قناعاً تكيفياً محلياً للأجزاء الداكنة والفاتحة.
+ * 3) يبحث عن شريط أرقام في كامل الصورة، لا في جهة ثابتة.
+ * 4) يصنف المقاطع السبعة ويبحث عن النقطة العشرية.
+ * 5) يستخدم ML Kit كخيار احتياطي.
+ */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: PreviewView
@@ -62,11 +71,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         cameraExecutor = Executors.newSingleThreadExecutor()
         buildScreen()
 
         if (ContextCompat.checkSelfPermission(
-                this, Manifest.permission.CAMERA
+                this,
+                Manifest.permission.CAMERA
             ) == PackageManager.PERMISSION_GRANTED
         ) {
             startCamera()
@@ -124,7 +135,9 @@ class MainActivity : AppCompatActivity() {
         root.addView(
             previewView,
             LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
             )
         )
         root.addView(status)
@@ -143,13 +156,9 @@ class MainActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
         )
+
         setContentView(root)
     }
-
-    private data class FrameBitmaps(
-        val original: Bitmap,
-        val binary: Bitmap
-    )
 
     private fun startCamera() {
         val providerFuture = ProcessCameraProvider.getInstance(this)
@@ -164,6 +173,7 @@ class MainActivity : AppCompatActivity() {
 
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setTargetResolution(android.util.Size(1280, 720))
                     .build()
 
                 analysis.setAnalyzer(cameraExecutor) { proxy ->
@@ -172,38 +182,42 @@ class MainActivity : AppCompatActivity() {
                         return@setAnalyzer
                     }
 
-                    var frames: FrameBitmaps? = null
+                    var bitmap: Bitmap? = null
                     try {
-                        frames = createFrameBitmaps(proxy)
+                        bitmap = imageProxyToGrayBitmap(proxy)
 
-                        if (frames == null) {
+                        if (bitmap == null) {
                             processing.set(false)
                             proxy.close()
                             return@setAnalyzer
                         }
 
-                        // نجرّب قارئ أرقام شاشة LCD أولاً، بصورة ثنائية محسّنة.
-                        val segmentMatch = recognizeSevenSegment(frames.binary)
+                        // التحليل السباعي يعمل على كامل الصورة، وليس على قصاصة يمينية ثابتة.
+                        val sevenSegmentMatch = recognizeSevenSegment(bitmap)
+                        val input = InputImage.fromBitmap(bitmap, 0)
+                        val bitmapForCleanup = bitmap
 
-                        // ML Kit يعمل على الصورة الرمادية الأصلية، لا على الصورة الثنائية فقط.
-                        recognizer.process(InputImage.fromBitmap(frames.original, 0))
+                        recognizer.process(input)
                             .addOnSuccessListener { result ->
-                                val match = segmentMatch ?: extractWeight(result)
+                                val match = sevenSegmentMatch ?: extractWeight(result)
                                 runOnUiThread { updateReading(match) }
                             }
                             .addOnFailureListener {
-                                runOnUiThread { updateReading(segmentMatch) }
+                                runOnUiThread { updateReading(sevenSegmentMatch) }
                             }
                             .addOnCompleteListener {
-                                frames?.original?.recycle()
-                                frames?.binary?.recycle()
+                                if (!bitmapForCleanup.isRecycled) {
+                                    bitmapForCleanup.recycle()
+                                }
                                 processing.set(false)
                                 proxy.close()
                             }
 
+                        bitmap = null // أصبحت ملكية التنظيف لمهمة ML Kit.
                     } catch (e: Exception) {
-                        frames?.original?.recycle()
-                        frames?.binary?.recycle()
+                        bitmap?.let {
+                            if (!it.isRecycled) it.recycle()
+                        }
                         processing.set(false)
                         proxy.close()
                     }
@@ -216,21 +230,17 @@ class MainActivity : AppCompatActivity() {
                     preview,
                     analysis
                 )
-
             } catch (e: Exception) {
                 status.text = "تعذر تشغيل الكاميرا: ${e.localizedMessage}"
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /*
-     * إنشاء صورتين من قناة الإضاءة Y:
-     * 1) صورة رمادية تحتفظ بتفاصيل الصورة لعمل ML Kit.
-     * 2) صورة ثنائية بتباين محلي لتحليل أرقام شاشة الميزان.
-     *
-     * لا نعتمد على اللون الأخضر أو على إضاءة الشاشة.
+    /**
+     * استخراج قناة Y (الإضاءة) من YUV_420_888.
+     * قناة Y صالحة سواء كانت الشاشة مضاءة أو مطفأة، ولا نفترض لوناً أخضر.
      */
-    private fun createFrameBitmaps(proxy: ImageProxy): FrameBitmaps? {
+    private fun imageProxyToGrayBitmap(proxy: ImageProxy): Bitmap? {
         val plane = proxy.planes.firstOrNull() ?: return null
         val buffer = plane.buffer.duplicate()
         val crop = proxy.cropRect
@@ -239,7 +249,7 @@ class MainActivity : AppCompatActivity() {
 
         if (width < 20 || height < 20) return null
 
-        val gray = IntArray(width * height)
+        val pixels = IntArray(width * height)
 
         for (y in 0 until height) {
             for (x in 0 until width) {
@@ -247,128 +257,27 @@ class MainActivity : AppCompatActivity() {
                     (y + crop.top) * plane.rowStride +
                     (x + crop.left) * plane.pixelStride
 
-                if (index >= buffer.limit()) return null
-
                 val value = buffer.get(index).toInt() and 0xFF
-                gray[y * width + x] =
-                    (0xFF shl 24) or (value shl 16) or
+                pixels[y * width + x] =
+                    (0xFF shl 24) or
+                    (value shl 16) or
                     (value shl 8) or value
             }
         }
 
         val rotation = proxy.imageInfo.rotationDegrees
-        val rotated = rotatePixels(gray, width, height, rotation)
-
+        val rotatedPixels = rotatePixels(pixels, width, height, rotation)
         val rotatedWidth =
             if (rotation == 90 || rotation == 270) height else width
         val rotatedHeight =
             if (rotation == 90 || rotation == 270) width else height
 
-        val full = Bitmap.createBitmap(
-            rotated, rotatedWidth, rotatedHeight, Bitmap.Config.ARGB_8888
+        return Bitmap.createBitmap(
+            rotatedPixels,
+            rotatedWidth,
+            rotatedHeight,
+            Bitmap.Config.ARGB_8888
         )
-
-        /*
-         * نحتفظ بمعظم عرض الصورة بدلاً من قص 35% من اليسار.
-         * هذا يمنع حذف الرقم الأول إذا كانت شاشة الميزان في منتصف الكادر.
-         */
-        val left = (rotatedWidth * 0.08f).toInt()
-        val right = (rotatedWidth * 0.92f).toInt()
-        val roiWidth = right - left
-
-        if (roiWidth < 20 || rotatedHeight < 20) {
-            full.recycle()
-            return null
-        }
-
-        val roi = Bitmap.createBitmap(
-            full, left, 0, roiWidth, rotatedHeight
-        )
-        full.recycle()
-
-        val pixels = IntArray(roi.width * roi.height)
-        roi.getPixels(
-            pixels, 0, roi.width, 0, 0, roi.width, roi.height
-        )
-
-        val original = Bitmap.createBitmap(
-            pixels, roi.width, roi.height, Bitmap.Config.ARGB_8888
-        )
-
-        val binaryPixels = adaptiveThreshold(
-            pixels, roi.width, roi.height
-        )
-
-        val binary = Bitmap.createBitmap(
-            binaryPixels, roi.width, roi.height, Bitmap.Config.ARGB_8888
-        )
-
-        roi.recycle()
-
-        // تكبير الصورة الثنائية لتسهيل تحليل المقاطع الصغيرة.
-        val enlarged = Bitmap.createScaledBitmap(
-            binary, binary.width * 2, binary.height * 2, false
-        )
-        binary.recycle()
-
-        return FrameBitmaps(original, enlarged)
-    }
-
-    /*
-     * عتبة محلية بدلاً من Otsu على كامل الصورة.
-     * هذا أفضل عندما تختلف إضاءة الشاشة أو توجد انعكاسات حولها.
-     */
-    private fun adaptiveThreshold(
-        pixels: IntArray,
-        width: Int,
-        height: Int
-    ): IntArray {
-        val stride = width + 1
-        val integral = IntArray((width + 1) * (height + 1))
-
-        for (y in 1..height) {
-            var rowSum = 0
-            for (x in 1..width) {
-                val gray = pixels[(y - 1) * width + (x - 1)] and 0xFF
-                rowSum += gray
-                integral[y * stride + x] =
-                    integral[(y - 1) * stride + x] + rowSum
-            }
-        }
-
-        val radius = max(8, min(width, height) / 35)
-        val output = IntArray(pixels.size)
-
-        for (y in 0 until height) {
-            val y1 = max(0, y - radius)
-            val y2 = min(height - 1, y + radius)
-
-            for (x in 0 until width) {
-                val x1 = max(0, x - radius)
-                val x2 = min(width - 1, x + radius)
-
-                val area =
-                    (x2 - x1 + 1) * (y2 - y1 + 1)
-
-                val sum =
-                    integral[(y2 + 1) * stride + (x2 + 1)] -
-                    integral[y1 * stride + (x2 + 1)] -
-                    integral[(y2 + 1) * stride + x1] +
-                    integral[y1 * stride + x1]
-
-                val mean = sum / area
-                val gray = pixels[y * width + x] and 0xFF
-
-                // أرقام LCD داكنة عادةً من خلفيتها.
-                val value = if (gray < mean - 8) 0 else 255
-
-                output[y * width + x] =
-                    (0xFF shl 24) or (value shl 16) or
-                    (value shl 8) or value
-            }
-        }
-
-        return output
     }
 
     private fun rotatePixels(
@@ -383,15 +292,16 @@ class MainActivity : AppCompatActivity() {
             if (rotation == 90 || rotation == 270) height else width
         val outHeight =
             if (rotation == 90 || rotation == 270) width else height
+
         val output = IntArray(outWidth * outHeight)
 
         for (y in 0 until height) {
             for (x in 0 until width) {
                 val destination = when (rotation) {
-                    90 -> x * outWidth + (height - 1 - y)
+                    90 -> (x * outWidth) + (height - 1 - y)
                     180 -> (height - 1 - y) * outWidth + (width - 1 - x)
                     270 -> (width - 1 - x) * outWidth + y
-                    else -> y * outWidth + x
+                    else -> y * width + x
                 }
                 output[destination] = source[y * width + x]
             }
@@ -404,86 +314,264 @@ class MainActivity : AppCompatActivity() {
         val right: Int,
         val top: Int,
         val bottom: Int
-    )
+    ) {
+        val width: Int get() = right - left + 1
+        val height: Int get() = bottom - top + 1
+    }
 
-    /*
-     * قارئ تقريبي للأرقام ذات السبعة مقاطع.
-     * لا يفترض أن الأرقام بخط Excel أو بخط مطبوع.
+    private data class RowBand(val top: Int, val bottom: Int) {
+        val height: Int get() = bottom - top + 1
+    }
+
+    /**
+     * يجرب قطبين تكيفيين:
+     * - الأجزاء الداكنة فوق خلفية أفتح (الحالة المعتادة).
+     * - الأجزاء الفاتحة فوق خلفية أغمق (احتياطاً).
      */
     private fun recognizeSevenSegment(bitmap: Bitmap): String? {
         val width = bitmap.width
         val height = bitmap.height
-        if (width < 20 || height < 20) return null
+        if (width < 80 || height < 80) return null
 
-        val pixels = IntArray(width * height)
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        val gray = IntArray(width * height)
+        val source = IntArray(width * height)
+        bitmap.getPixels(source, 0, width, 0, 0, width, height)
 
-        fun isDark(x: Int, y: Int): Boolean {
-            if (x !in 0 until width || y !in 0 until height) return false
-            return (pixels[y * width + x] and 0xFF) < 128
+        for (i in source.indices) {
+            gray[i] = source[i] and 0xFF
         }
 
-        val columnCounts = IntArray(width)
-        for (x in 0 until width) {
-            for (y in 0 until height) {
-                if (isDark(x, y)) columnCounts[x]++
+        val darkMask = adaptiveMask(gray, width, height, darkForeground = true)
+        val lightMask = adaptiveMask(gray, width, height, darkForeground = false)
+
+        val darkResult = decodeMask(darkMask, width, height)
+        if (darkResult != null) return darkResult
+
+        return decodeMask(lightMask, width, height)
+    }
+
+    /**
+     * عتبة محلية مبنية على متوسط نافذة حول كل بكسل.
+     * هذا أفضل من Otsu العام عندما توجد ظلال أو انعكاسات أو إضاءة غير متساوية.
+     */
+    private fun adaptiveMask(
+        gray: IntArray,
+        width: Int,
+        height: Int,
+        darkForeground: Boolean
+    ): BooleanArray {
+        val stride = width + 1
+        val integral = LongArray((width + 1) * (height + 1))
+
+        for (y in 1..height) {
+            var rowSum = 0L
+            for (x in 1..width) {
+                rowSum += gray[(y - 1) * width + (x - 1)]
+                integral[y * stride + x] =
+                    integral[(y - 1) * stride + x] + rowSum
             }
         }
 
-        /*
-         * لا نستخدم 6% من ارتفاع الصورة كما في النسخة السابقة؛
-         * لأن ذلك كان يستبعد الأعمدة التي لا تحتوي إلا على أجزاء من الرقم.
-         */
-        val columnThreshold = max(2, (height * 0.012f).toInt())
-        val active = BooleanArray(width) { x ->
-            columnCounts[x] >= columnThreshold
+        val radius = max(8, min(width, height) / 28)
+        val offset = 7.0
+        val mask = BooleanArray(width * height)
+
+        for (y in 0 until height) {
+            val y1 = max(0, y - radius)
+            val y2 = min(height - 1, y + radius)
+
+            for (x in 0 until width) {
+                val x1 = max(0, x - radius)
+                val x2 = min(width - 1, x + radius)
+
+                val count = (x2 - x1 + 1) * (y2 - y1 + 1)
+                val sum =
+                    integral[(y2 + 1) * stride + (x2 + 1)] -
+                    integral[y1 * stride + (x2 + 1)] -
+                    integral[(y2 + 1) * stride + x1] +
+                    integral[y1 * stride + x1]
+
+                val mean = sum.toDouble() / count
+                val value = gray[y * width + x].toDouble()
+
+                mask[y * width + x] =
+                    if (darkForeground) value < mean - offset
+                    else value > mean + offset
+            }
         }
+
+        return mask
+    }
+
+    private fun decodeMask(
+        mask: BooleanArray,
+        width: Int,
+        height: Int
+    ): String? {
+        // نبحث عن صفوف تحتوي على كمية مناسبة من بكسلات الأرقام.
+        val rowCounts = IntArray(height)
+        for (y in 0 until height) {
+            var count = 0
+            val start = y * width
+            for (x in 0 until width) {
+                if (mask[start + x]) count++
+            }
+            rowCounts[y] = count
+        }
+
+        val rowThreshold = max(4, (width * 0.008f).toInt())
+        val bands = findRuns(rowCounts, rowThreshold, maxGap = 2)
+            .map { RowBand(it.first, it.second) }
+            .filter {
+                it.height >= height * 0.035f &&
+                it.height <= height * 0.55f
+            }
+
+        if (bands.isEmpty()) return null
+
+        var bestResult: String? = null
+        var bestScore = Int.MIN_VALUE
+
+        for (band in bands) {
+            val boxes = findDigitBoxes(mask, width, height, band)
+            if (boxes.size !in 2..8) continue
+
+            val heights = boxes.map { it.height }.sorted()
+            val medianHeight = heights[heights.size / 2]
+
+            // استبعاد القطع الصغيرة أو العريضة التي لا تشبه أرقام الميزان.
+            if (medianHeight < 8) continue
+            if (boxes.any {
+                    it.height < medianHeight * 0.48f ||
+                    it.width < medianHeight * 0.10f ||
+                    it.width > medianHeight * 0.95f
+                }) continue
+
+            val digits = mutableListOf<Char>()
+            var failed = false
+
+            for (box in boxes) {
+                val digit = classifyDigit(mask, width, height, box)
+                if (digit == null) {
+                    failed = true
+                    break
+                }
+                digits.add(digit)
+            }
+            if (failed) continue
+
+            val output = StringBuilder()
+            for (i in digits.indices) {
+                output.append(digits[i])
+                if (hasDecimalBetween(
+                        mask, width, height, band, boxes, i
+                    )
+                ) {
+                    output.append('.')
+                }
+            }
+
+            val value = output.toString()
+            if (!isValidWeight(value)) continue
+
+            val score =
+                boxes.size * 100 +
+                medianHeight -
+                boxes.sumOf { abs(it.height - medianHeight) }
+
+            if (score > bestScore) {
+                bestScore = score
+                bestResult = value
+            }
+        }
+
+        return bestResult
+    }
+
+    private fun findRuns(
+        values: IntArray,
+        threshold: Int,
+        maxGap: Int
+    ): List<Pair<Int, Int>> {
+        val runs = mutableListOf<Pair<Int, Int>>()
+        var start = -1
+        var lastActive = -1
+
+        for (i in values.indices) {
+            if (values[i] >= threshold) {
+                if (start < 0) start = i
+                lastActive = i
+            } else if (start >= 0 && i - lastActive > maxGap) {
+                runs.add(start to lastActive)
+                start = -1
+                lastActive = -1
+            }
+        }
+
+        if (start >= 0) runs.add(start to lastActive)
+        return runs
+    }
+
+    private fun findDigitBoxes(
+        mask: BooleanArray,
+        width: Int,
+        height: Int,
+        band: RowBand
+    ): List<DigitBox> {
+        val columnCounts = IntArray(width)
+
+        for (x in 0 until width) {
+            var count = 0
+            for (y in band.top..band.bottom) {
+                if (mask[y * width + x]) count++
+            }
+            columnCounts[x] = count
+        }
+
+        val threshold = max(2, (band.height * 0.035f).toInt())
+        val runs = findRuns(columnCounts, threshold, maxGap = 1)
 
         val boxes = mutableListOf<DigitBox>()
-        var x = 0
 
-        while (x < width) {
-            if (!active[x]) {
-                x++
-                continue
-            }
-
-            val start = x
-            while (x < width && active[x]) x++
-            val end = x - 1
-            val digitWidth = end - start + 1
+        for ((left, right) in runs) {
+            val runWidth = right - left + 1
+            if (runWidth < band.height * 0.10f ||
+                runWidth > band.height * 0.95f
+            ) continue
 
             var top = height
             var bottom = -1
 
-            for (yy in 0 until height) {
-                var count = 0
-                for (xx in start..end) {
-                    if (isDark(xx, yy)) count++
+            for (y in band.top..band.bottom) {
+                var rowCount = 0
+                for (x in left..right) {
+                    if (mask[y * width + x]) rowCount++
                 }
-
-                if (count >= max(2, (digitWidth * 0.07f).toInt())) {
-                    top = min(top, yy)
-                    bottom = max(bottom, yy)
+                if (rowCount > 0) {
+                    top = min(top, y)
+                    bottom = max(bottom, y)
                 }
             }
 
             if (bottom > top) {
-                val digitHeight = bottom - top + 1
-
-                // المقارنة هنا مع ارتفاع الرقم نفسه، لا ارتفاع إطار الكاميرا.
-                if (digitWidth >= digitHeight * 0.12f &&
-                    digitWidth <= digitHeight * 0.90f
-                ) {
-                    boxes.add(DigitBox(start, end, top, bottom))
-                }
+                boxes.add(DigitBox(left, right, top, bottom))
             }
         }
 
-        if (boxes.size !in 2..6) return null
+        return boxes.sortedBy { it.left }
+    }
 
-        // ترتيب المقاطع: أعلى، يمين أعلى، يمين أسفل، أسفل،
-        // يسار أسفل، يسار أعلى، الوسط.
+    /**
+     * ترتيب المقاطع:
+     * 0 أعلى، 1 يمين أعلى، 2 يمين أسفل، 3 أسفل،
+     * 4 يسار أسفل، 5 يسار أعلى، 6 الوسط.
+     */
+    private fun classifyDigit(
+        mask: BooleanArray,
+        imageWidth: Int,
+        imageHeight: Int,
+        box: DigitBox
+    ): Char? {
         val patterns = mapOf(
             63 to '0',
             6 to '1',
@@ -497,140 +585,121 @@ class MainActivity : AppCompatActivity() {
             111 to '9'
         )
 
-        fun segmentIsOn(
-            box: DigitBox,
-            centerX: Float,
-            centerY: Float,
-            patchWidth: Float,
-            patchHeight: Float
-        ): Boolean {
-            val digitWidth = (box.right - box.left + 1).toFloat()
-            val digitHeight = (box.bottom - box.top + 1).toFloat()
+        val points = arrayOf(
+            0.50f to 0.12f,
+            0.86f to 0.30f,
+            0.86f to 0.70f,
+            0.50f to 0.88f,
+            0.14f to 0.70f,
+            0.14f to 0.30f,
+            0.50f to 0.50f
+        )
 
-            val x1 = max(
-                box.left,
-                (box.left + digitWidth * centerX - patchWidth / 2).toInt()
-            )
-            val x2 = min(
-                box.right,
-                (box.left + digitWidth * centerX + patchWidth / 2).toInt()
-            )
-            val y1 = max(
-                box.top,
-                (box.top + digitHeight * centerY - patchHeight / 2).toInt()
-            )
-            val y2 = min(
-                box.bottom,
-                (box.top + digitHeight * centerY + patchHeight / 2).toInt()
-            )
+        var bits = 0
 
-            if (x2 < x1 || y2 < y1) return false
+        for (i in points.indices) {
+            val cx = box.left + points[i].first * box.width
+            val cy = box.top + points[i].second * box.height
 
-            var dark = 0
+            val patchW = max(2, (box.width * 0.20f).toInt())
+            val patchH = max(2, (box.height * 0.16f).toInt())
+
+            val x1 = max(box.left, (cx - patchW / 2f).toInt())
+            val x2 = min(box.right, (cx + patchW / 2f).toInt())
+            val y1 = max(box.top, (cy - patchH / 2f).toInt())
+            val y2 = min(box.bottom, (cy + patchH / 2f).toInt())
+
+            var active = 0
             var total = 0
-            for (yy in y1..y2) {
-                for (xx in x1..x2) {
-                    total++
-                    if (isDark(xx, yy)) dark++
-                }
-            }
-            return total > 0 && dark.toFloat() / total >= 0.28f
-        }
 
-        fun classifyDigit(box: DigitBox): Char? {
-            val digitWidth = (box.right - box.left + 1).toFloat()
-            val digitHeight = (box.bottom - box.top + 1).toFloat()
-            if (digitWidth <= 0 || digitHeight <= 0) return null
-
-            val points = arrayOf(
-                0.50f to 0.12f,
-                0.86f to 0.30f,
-                0.86f to 0.70f,
-                0.50f to 0.88f,
-                0.14f to 0.70f,
-                0.14f to 0.30f,
-                0.50f to 0.50f
-            )
-
-            var mask = 0
-            for (i in points.indices) {
-                val p = points[i]
-                if (segmentIsOn(
-                        box, p.first, p.second,
-                        digitWidth * 0.24f, digitHeight * 0.20f
-                    )
-                ) {
-                    mask = mask or (1 shl i)
-                }
-            }
-
-            val best = patterns.minByOrNull {
-                Integer.bitCount(it.key xor mask)
-            } ?: return null
-
-            if (Integer.bitCount(best.key xor mask) > 1) return null
-            return best.value
-        }
-
-        val digits = boxes.map { classifyDigit(it) ?: return null }
-
-        fun hasDecimalAfter(index: Int): Boolean {
-            val current = boxes[index]
-            val next = boxes.getOrNull(index + 1) ?: return false
-
-            val gapStart = current.right + 1
-            val gapEnd = next.left - 1
-            if (gapEnd < gapStart) return false
-
-            val digitHeight = current.bottom - current.top + 1
-            val lowerStart = current.top + (digitHeight * 0.72f).toInt()
-            val lowerEnd = min(
-                height - 1,
-                current.bottom + max(2, (digitHeight * 0.18f).toInt())
-            )
-            if (lowerStart > lowerEnd) return false
-
-            var darkCount = 0
-            var minX = width
-            var maxX = -1
-            var minY = height
-            var maxY = -1
-
-            for (yy in lowerStart..lowerEnd) {
-                for (xx in gapStart..gapEnd) {
-                    if (isDark(xx, yy)) {
-                        darkCount++
-                        minX = min(minX, xx)
-                        maxX = max(maxX, xx)
-                        minY = min(minY, yy)
-                        maxY = max(maxY, yy)
+            for (y in y1..y2) {
+                for (x in x1..x2) {
+                    if (x in 0 until imageWidth && y in 0 until imageHeight) {
+                        total++
+                        if (mask[y * imageWidth + x]) active++
                     }
                 }
             }
 
-            if (darkCount < 2) return false
-            val dotWidth = maxX - minX + 1
-            val dotHeight = maxY - minY + 1
-
-            return dotWidth <= digitHeight * 0.22f &&
-                dotHeight <= digitHeight * 0.24f
+            if (total > 0 && active.toFloat() / total >= 0.28f) {
+                bits = bits or (1 shl i)
+            }
         }
 
-        val output = StringBuilder()
-        for (i in digits.indices) {
-            output.append(digits[i])
-            if (hasDecimalAfter(i)) output.append('.')
+        val best = patterns.minByOrNull {
+            Integer.bitCount(it.key xor bits)
+        } ?: return null
+
+        // السماح باختلاف مقطع واحد فقط لتجنب التخمين الخاطئ.
+        if (Integer.bitCount(best.key xor bits) > 1) return null
+        return best.value
+    }
+
+    private fun hasDecimalBetween(
+        mask: BooleanArray,
+        width: Int,
+        height: Int,
+        band: RowBand,
+        boxes: List<DigitBox>,
+        index: Int
+    ): Boolean {
+        val current = boxes[index]
+        val next = boxes.getOrNull(index + 1) ?: return false
+
+        val gapLeft = current.right + 1
+        val gapRight = next.left - 1
+        if (gapRight < gapLeft) return false
+
+        val yStart = max(
+            band.top,
+            current.top + (current.height * 0.70f).toInt()
+        )
+        val yEnd = min(
+            height - 1,
+            band.bottom + (current.height * 0.18f).toInt()
+        )
+
+        var count = 0
+        var minX = width
+        var maxX = -1
+        var minY = height
+        var maxY = -1
+
+        for (y in yStart..yEnd) {
+            for (x in gapLeft..gapRight) {
+                if (x in 0 until width && mask[y * width + x]) {
+                    count++
+                    minX = min(minX, x)
+                    maxX = max(maxX, x)
+                    minY = min(minY, y)
+                    maxY = max(maxY, y)
+                }
+            }
         }
 
-        val value = output.toString()
-        if (!value.contains('.') || value.count { it == '.' } != 1) return null
-        if (value.startsWith('.') || value.endsWith('.')) return null
+        if (count < 2) return false
 
-        return value.takeIf { it.toDoubleOrNull() != null }
+        val dotWidth = maxX - minX + 1
+        val dotHeight = maxY - minY + 1
+
+        return dotWidth <= current.height * 0.24f &&
+               dotHeight <= current.height * 0.24f &&
+               minY >= current.top + current.height * 0.58f
+    }
+
+    private fun isValidWeight(value: String): Boolean {
+        if (value.count { it == '.' } != 1) return false
+        if (value.startsWith('.') || value.endsWith('.')) return false
+
+        val parts = value.split('.')
+        if (parts.size != 2) return false
+        if (parts[0].length !in 1..6) return false
+        if (parts[1].length !in 1..3) return false
+        return value.toDoubleOrNull() != null
     }
 
     private fun updateReading(match: String?) {
-        if (match != null) {
+        if (match != null && isValidWeight(match)) {
             if (match == pendingCandidate) {
                 stableCount++
             } else {
@@ -655,11 +724,13 @@ class MainActivity : AppCompatActivity() {
             stableCount = 0
             detected.text = "— — —"
             confirm.isEnabled = false
-            status.text = "لم يتم تمييز الأرقام بعد. قرّب الكاميرا وثبّتها أمام الشاشة."
+            status.text = "جارٍ البحث عن أرقام شاشة الميزان..."
         }
     }
 
-    // OCR احتياطي للأرقام المطبوعة أو الواضحة.
+    /**
+     * OCR احتياطي. يقبل خانة أو خانتين أو ثلاث خانات عشرية.
+     */
     private fun extractWeight(result: Text): String? {
         val pattern = Regex(
             "(?<![0-9])([0-9]{1,6})[.,٫،]([0-9]{1,3})(?![0-9])"
@@ -675,15 +746,16 @@ class MainActivity : AppCompatActivity() {
                         '٫', '،', ',' -> '.'
                         else -> char
                     }
-                }.joinToString("").replace(Regex("\\s+"), "")
+                }.joinToString("")
+                    .replace(Regex("\\s+"), "")
 
                 val match = pattern.find(normalized) ?: return@mapNotNull null
                 val value = "${match.groupValues[1]}.${match.groupValues[2]}"
-                if (value.toDoubleOrNull() == null) return@mapNotNull null
 
-                val height = line.boundingBox?.height() ?: 0
-                val width = line.boundingBox?.width() ?: 0
-                Triple(value, height, width)
+                if (!isValidWeight(value)) return@mapNotNull null
+
+                val box = line.boundingBox
+                Triple(value, box?.height() ?: 0, box?.width() ?: 0)
             }
 
         return candidates.maxWithOrNull(
@@ -701,15 +773,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (::cameraExecutor.isInitialized) {
-            cameraExecutor.shutdown()
-        }
+        cameraExecutor.shutdown()
         recognizer.close()
     }
 }
-'''
-
-path = Path("/mnt/data/MainActivity_Updated.kt")
-path.write_text(source, encoding="utf-8")
-print(f"تم إنشاء الملف: {path.name}")
-print(f"عدد الأسطر: {len(source.splitlines())}")
