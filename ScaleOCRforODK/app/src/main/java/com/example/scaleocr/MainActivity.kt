@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.os.Bundle
 import android.view.Gravity
 import android.view.ViewGroup
@@ -183,17 +184,34 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         val bitmapForCleanup = bitmap
-                        val input = InputImage.fromBitmap(bitmap, 0)
-
-                        recognizer.process(input)
+                        
+                        // نقوم بمعالجة الصورة الأصلية وأيضاً نسخة مقلوبة/مدورة بـ 90 درجة لضمان قراءة الأرقام العمودية في الميزان
+                        val inputOriginal = InputImage.fromBitmap(bitmapForCleanup, 0)
+                        
+                        recognizer.process(inputOriginal)
                             .addOnSuccessListener { result ->
-                                val mlKitMatch = extractWeight(result)
-                                val finalMatch = mlKitMatch ?: recognizeSevenSegment(bitmapForCleanup)
-                                runOnUiThread { updateReading(finalMatch) }
+                                var match = extractWeight(result)
+                                
+                                if (match == null) {
+                                    // إذا لم نجدها في الاتجاه العادي، نجرب تدوير الصورة 90 درجة لمعالجة الشاشات العمودية
+                                    val rotatedBitmap = rotateBitmap(bitmapForCleanup, 90f)
+                                    val inputRotated = InputImage.fromBitmap(rotatedBitmap, 0)
+                                    recognizer.process(inputRotated)
+                                        .addOnSuccessListener { rotatedResult ->
+                                            val rotatedMatch = extractWeight(rotatedResult)
+                                            if (!rotatedBitmap.isRecycled) rotatedBitmap.recycle()
+                                            runOnUiThread { updateReading(rotatedMatch) }
+                                        }
+                                        .addOnFailureListener {
+                                            if (!rotatedBitmap.isRecycled) rotatedBitmap.recycle()
+                                            runOnUiThread { updateReading(null) }
+                                        }
+                                } else {
+                                    runOnUiThread { updateReading(match) }
+                                }
                             }
                             .addOnFailureListener {
-                                val sevenSegmentMatch = recognizeSevenSegment(bitmapForCleanup)
-                                runOnUiThread { updateReading(sevenSegmentMatch) }
+                                runOnUiThread { updateReading(null) }
                             }
                             .addOnCompleteListener {
                                 if (!bitmapForCleanup.isRecycled) {
@@ -224,6 +242,11 @@ class MainActivity : AppCompatActivity() {
                 status.text = "تعذر تشغيل الكاميرا: ${e.localizedMessage}"
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun rotateBitmap(source: Bitmap, angle: Float): Bitmap {
+        val matrix = Matrix().apply { postRotate(angle) }
+        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
     }
 
     private fun imageProxyToGrayBitmap(proxy: ImageProxy): Bitmap? {
@@ -295,349 +318,12 @@ class MainActivity : AppCompatActivity() {
         return output
     }
 
-    private data class DigitBox(
-        val left: Int,
-        val right: Int,
-        val top: Int,
-        val bottom: Int
-    ) {
-        val width: Int get() = right - left + 1
-        val height: Int get() = bottom - top + 1
-    }
-
-    private data class RowBand(val top: Int, val bottom: Int) {
-        val height: Int get() = bottom - top + 1
-    }
-
-    private fun recognizeSevenSegment(bitmap: Bitmap): String? {
-        val width = bitmap.width
-        val height = bitmap.height
-        if (width < 80 || height < 80) return null
-
-        val gray = IntArray(width * height)
-        val source = IntArray(width * height)
-        bitmap.getPixels(source, 0, width, 0, 0, width, height)
-
-        for (i in source.indices) {
-            gray[i] = source[i] and 0xFF
-        }
-
-        val darkMask = adaptiveMask(gray, width, height, darkForeground = true)
-        val lightMask = adaptiveMask(gray, width, height, darkForeground = false)
-
-        val darkResult = decodeMask(darkMask, width, height)
-        if (darkResult != null) return darkResult
-
-        return decodeMask(lightMask, width, height)
-    }
-
-    private fun adaptiveMask(
-        gray: IntArray,
-        width: Int,
-        height: Int,
-        darkForeground: Boolean
-    ): BooleanArray {
-        val stride = width + 1
-        val integral = LongArray((width + 1) * (height + 1))
-
-        for (y in 1..height) {
-            var rowSum = 0L
-            for (x in 1..width) {
-                rowSum += gray[(y - 1) * width + (x - 1)]
-                integral[y * stride + x] =
-                    integral[(y - 1) * stride + x] + rowSum
-            }
-        }
-
-        val radius = max(8, min(width, height) / 28)
-        val offset = 7.0
-        val mask = BooleanArray(width * height)
-
-        for (y in 0 until height) {
-            val y1 = max(0, y - radius)
-            val y2 = min(height - 1, y + radius)
-
-            for (x in 0 until width) {
-                val x1 = max(0, x - radius)
-                val x2 = min(width - 1, x + radius)
-
-                val count = (x2 - x1 + 1) * (y2 - y1 + 1)
-                val sum =
-                    integral[(y2 + 1) * stride + (x2 + 1)] -
-                    integral[y1 * stride + (x2 + 1)] -
-                    integral[(y2 + 1) * stride + x1] +
-                    integral[y1 * stride + x1]
-
-                val mean = sum.toDouble() / count
-                val value = gray[y * width + x].toDouble()
-
-                mask[y * width + x] =
-                    if (darkForeground) value < mean - offset
-                    else value > mean + offset
-            }
-        }
-
-        return mask
-    }
-
-    private fun decodeMask(
-        mask: BooleanArray,
-        width: Int,
-        height: Int
-    ): String? {
-        val rowCounts = IntArray(height)
-        for (y in 0 until height) {
-            var count = 0
-            val start = y * width
-            for (x in 0 until width) {
-                if (mask[start + x]) count++
-            }
-            rowCounts[y] = count
-        }
-
-        val rowThreshold = max(4, (width * 0.008f).toInt())
-        val bands = findRuns(rowCounts, rowThreshold, maxGap = 2)
-            .map { RowBand(it.first, it.second) }
-            .filter {
-                it.height >= height * 0.035f &&
-                it.height <= height * 0.55f
-            }
-
-        if (bands.isEmpty()) return null
-
-        var bestResult: String? = null
-        var bestScore = Int.MIN_VALUE
-
-        for (band in bands) {
-            val boxes = findDigitBoxes(mask, width, height, band)
-            if (boxes.size !in 1..8) continue
-
-            val heights = boxes.map { it.height }.sorted()
-            val medianHeight = heights[heights.size / 2]
-
-            if (medianHeight < 6) continue
-
-            val digits = mutableListOf<Char>()
-            var failed = false
-
-            for (box in boxes) {
-                val digit = classifyDigit(mask, width, height, box)
-                if (digit == null) {
-                    failed = true
-                    break
-                }
-                digits.add(digit)
-            }
-            if (failed) continue
-
-            val output = StringBuilder()
-            for (i in digits.indices) {
-                output.append(digits[i])
-                if (hasDecimalBetween(
-                        mask, width, height, band, boxes, i
-                    )
-                ) {
-                    output.append('.')
-                }
-            }
-
-            val value = output.toString()
-            if (!isValidWeight(value)) continue
-
-            val score =
-                boxes.size * 100 +
-                medianHeight -
-                boxes.sumOf { abs(it.height - medianHeight) }
-
-            if (score > bestScore) {
-                bestScore = score
-                bestResult = value
-            }
-        }
-
-        return bestResult
-    }
-
-    private fun findRuns(
-        values: IntArray,
-        threshold: Int,
-        maxGap: Int
-    ): List<Pair<Int, Int>> {
-        val runs = mutableListOf<Pair<Int, Int>>()
-        var start = -1
-        var lastActive = -1
-
-        for (i in values.indices) {
-            if (values[i] >= threshold) {
-                if (start < 0) start = i
-                lastActive = i
-            } else if (start >= 0 && i - lastActive > maxGap) {
-                runs.add(start to lastActive)
-                start = -1
-                lastActive = -1
-            }
-        }
-
-        if (start >= 0) runs.add(start to lastActive)
-        return runs
-    }
-
-    private fun findDigitBoxes(
-        mask: BooleanArray,
-        width: Int,
-        height: Int,
-        band: RowBand
-    ): List<DigitBox> {
-        val columnCounts = IntArray(width)
-
-        for (x in 0 until width) {
-            var count = 0
-            for (y in band.top..band.bottom) {
-                if (mask[y * width + x]) count++
-            }
-            columnCounts[x] = count
-        }
-
-        val threshold = max(2, (band.height * 0.030f).toInt())
-        val runs = findRuns(columnCounts, threshold, maxGap = 1)
-
-        val boxes = mutableListOf<DigitBox>()
-
-        for ((left, right) in runs) {
-            val runWidth = right - left + 1
-            if (runWidth < band.height * 0.05f ||
-                runWidth > band.height * 1.2f
-            ) continue
-
-            var top = height
-            var bottom = -1
-
-            for (y in band.top..band.bottom) {
-                var rowCount = 0
-                for (x in left..right) {
-                    if (mask[y * width + x]) rowCount++
-                }
-                if (rowCount > 0) {
-                    top = min(top, y)
-                    bottom = max(bottom, y)
-                }
-            }
-
-            if (bottom > top) {
-                boxes.add(DigitBox(left, right, top, bottom))
-            }
-        }
-
-        return boxes.sortedBy { it.left }
-    }
-
-    private fun classifyDigit(
-        mask: BooleanArray,
-        imageWidth: Int,
-        imageHeight: Int,
-        box: DigitBox
-    ): Char? {
-        val patterns = mapOf(
-            63 to '0',
-            6 to '1',
-            91 to '2',
-            79 to '3',
-            102 to '4',
-            109 to '5',
-            125 to '6',
-            7 to '7',
-            127 to '8',
-            111 to '9'
-        )
-
-        val points = arrayOf(
-            0.50f to 0.12f,
-            0.86f to 0.30f,
-            0.86f to 0.70f,
-            0.50f to 0.88f,
-            0.14f to 0.70f,
-            0.14f to 0.30f,
-            0.50f to 0.50f
-        )
-
-        var bits = 0
-
-        for (i in points.indices) {
-            val cx = box.left + points[i].first * box.width
-            val cy = box.top + points[i].second * box.height
-
-            val patchW = max(2, (box.width * 0.20f).toInt())
-            val patchH = max(2, (box.height * 0.16f).toInt())
-
-            val x1 = max(box.left, (cx - patchW / 2f).toInt())
-            val x2 = min(box.right, (cx + patchW / 2f).toInt())
-            val y1 = max(box.top, (cy - patchH / 2f).toInt())
-            val y2 = min(box.bottom, (cy + patchH / 2f).toInt())
-
-            var active = 0
-            var total = 0
-
-            for (y in y1..y2) {
-                for (x in x1..x2) {
-                    if (x in 0 until imageWidth && y in 0 until imageHeight) {
-                        total++
-                        if (mask[y * imageWidth + x]) active++
-                    }
-                }
-            }
-
-            if (total > 0 && active.toFloat() / total >= 0.20f) {
-                bits = bits or (1 shl i)
-            }
-        }
-
-        val best = patterns.minByOrNull {
-            Integer.bitCount(it.key xor bits)
-        } ?: return null
-
-        if (Integer.bitCount(best.key xor bits) > 2) return null
-        return best.value
-    }
-
-    private fun hasDecimalBetween(
-        mask: BooleanArray,
-        width: Int,
-        height: Int,
-        band: RowBand,
-        boxes: List<DigitBox>,
-        index: Int
-    ): Boolean {
-        val current = boxes[index]
-        val next = boxes.getOrNull(index + 1) ?: return false
-
-        val gapLeft = current.right + 1
-        val gapRight = next.left - 1
-        if (gapRight < gapLeft) return false
-
-        val yStart = max(
-            band.top,
-            current.top + (current.height * 0.60f).toInt()
-        )
-        val yEnd = min(
-            height - 1,
-            band.bottom + (current.height * 0.25f).toInt()
-        )
-
-        var count = 0
-        for (y in yStart..yEnd) {
-            for (x in gapLeft..gapRight) {
-                if (x in 0 until width && mask[y * width + x]) {
-                    count++
-                }
-            }
-        }
-
-        return count >= 1
-    }
-
     private fun isValidWeight(value: String): Boolean {
         if (value.isEmpty()) return false
-        return value.toDoubleOrNull() != null
+        // نتأكد أن القراءة تحتوي على أرقام منطقية للميزان (نستبعد الأرقام القصيرة جداً مثل رقم واحد منفرد إذا لم تكن عشرية، ونقبل الأرقام التي تحتوي على فاصلة أو مكونة من خانتين فأكثر)
+        val d = value.toDoubleOrNull() ?: return false
+        if (value.length == 1 && d < 10) return false // تجاهل الأرقام المنفردة الصغيرة مثل 9 الخاطئة
+        return true
     }
 
     private fun updateReading(match: String?) {
@@ -670,9 +356,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * دمج ذكي للنصوص المستخرجة من شاشة الميزان لضمان التقاط الرقم كاملاً (مثل 21.03)
+     */
     private fun extractWeight(result: Text): String? {
-        val cleanResults = mutableListOf<String>()
-
+        val allTextBuilder = StringBuilder()
+        
         for (block in result.textBlocks) {
             for (line in block.lines) {
                 val normalized = line.text.map { char ->
@@ -684,13 +373,52 @@ class MainActivity : AppCompatActivity() {
                     }
                 }.joinToString("").replace(Regex("[^0-9.]"), "")
 
-                if (normalized.isNotEmpty() && isValidWeight(normalized)) {
-                    cleanResults.add(normalized)
+                if (normalized.isNotEmpty()) {
+                    allTextBuilder.append(normalized).append(" ")
                 }
             }
         }
 
-        return cleanResults.maxByOrNull { it.length }
+        val combinedText = allTextBuilder.toString().replace(Regex("\\s+"), "")
+        
+        // البحث عن نمط أرقام يتضمن فاصلة أو مكون من خانات متعددة (مثل 2103 أو 21.03)
+        // إذا كان الميزان يعرض الرقم بدون فاصلة واضحة أو بفاصلة، نحاول تصحيحه
+        val exactPattern = Regex("([0-9]{2,5})\\.?([0-9]{2})")
+        val match = exactPattern.find(combinedText)
+        if (match != null) {
+            val integerPart = match.groupValues[1]
+            val decimalPart = match.groupValues[2]
+            
+            // إذا كان الرقم طويلاً بدون فاصلة صريحة (مثل 2103)، نقوم بوضع الفاصلة قبل آخر خانتين تلقائياً ليصبح 21.03
+            val formatted = if (!combinedText.contains(".")) {
+                if (integerPart.length >= 3) {
+                    val mainInt = integerPart.substring(0, integerPart.length - 2)
+                    val dec = integerPart.takeLast(2)
+                    "$mainInt.$dec"
+                } else {
+                    integerPart
+                }
+            } else {
+                "$integerPart.$decimalPart"
+            }
+
+            if (isValidWeight(formatted)) {
+                return formatted
+            }
+        }
+
+        // خيار احتياطي: البحث عن أي رقم صحيح طويل صالح
+        val candidateList = mutableListOf<String>()
+        for (block in result.textBlocks) {
+            for (line in block.lines) {
+                val lineClean = line.text.replace(Regex("[^0-9.]"), "")
+                if (lineClean.length >= 2 && isValidWeight(lineClean)) {
+                    candidateList.add(lineClean)
+                }
+            }
+        }
+
+        return candidateList.maxByOrNull { it.length }
     }
 
     private fun returnValue() {
