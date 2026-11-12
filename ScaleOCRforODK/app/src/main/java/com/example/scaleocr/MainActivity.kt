@@ -48,7 +48,7 @@ class MainActivity : AppCompatActivity() {
 
     private var pendingCandidate: String? = null
     private var stableCount = 0
-    private val requiredStableReads = 2 // تم تقليل عدد القراءات المتطابقة لتسريع الاستجابة
+    private val requiredStableReads = 2
 
     private val cameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -101,7 +101,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         detected = TextView(this).apply {
-            text = "— — —"
+            text = "---"
             textSize = 34f
             gravity = Gravity.CENTER
             setPadding(0, 8, 0, 14)
@@ -185,11 +185,9 @@ class MainActivity : AppCompatActivity() {
                         val bitmapForCleanup = bitmap
                         val input = InputImage.fromBitmap(bitmap, 0)
 
-                        // الاعتماد الأساسي على ML Kit للتعرف السريع والدقيق على شاشات الميزان والكمبيوتر
                         recognizer.process(input)
                             .addOnSuccessListener { result ->
                                 val mlKitMatch = extractWeight(result)
-                                // إذا لم يجد ML Kit نتيجة واضحة، نحاول باستخدام الخوارزمية البديلة
                                 val finalMatch = mlKitMatch ?: recognizeSevenSegment(bitmapForCleanup)
                                 runOnUiThread { updateReading(finalMatch) }
                             }
@@ -639,7 +637,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun isValidWeight(value: String): Boolean {
         if (value.isEmpty()) return false
-        // السماح بقراءة الأرقام الصحيحة أو العشرية بمرونة كاملة
         return value.toDoubleOrNull() != null
     }
 
@@ -667,15 +664,12 @@ class MainActivity : AppCompatActivity() {
             candidate = null
             pendingCandidate = null
             stableCount = 0
-            detected.text = — — —
+            detected.text = "---"
             confirm.isEnabled = false
             status.text = "جارٍ البحث عن أرقام شاشة الميزان..."
         }
     }
 
-    /**
-     * OCR محسن ومعدل ليتعامل مع أرقام شاشات الموازان وشاشات الكمبيوتر بمرونة عالية.
-     */
     private fun extractWeight(result: Text): String? {
         val cleanResults = mutableListOf<String>()
 
@@ -696,7 +690,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // إرجاع أطول رقم تم التعرف عليه (عادةً هو قيمة الوزن الكاملة على الشاشة)
         return cleanResults.maxByOrNull { it.length }
     }
 
