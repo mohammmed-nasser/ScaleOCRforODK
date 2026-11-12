@@ -30,16 +30,6 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * قارئ وزن لشاشات LCD/LED ذات المقاطع السبعة.
- *
- * لا يعتمد على كون الإضاءة الخلفية خضراء أو مضاءة:
- * 1) يستخدم قناة الإضاءة Y من صورة الكاميرا.
- * 2) ينشئ قناعاً تكيفياً محلياً للأجزاء الداكنة والفاتحة.
- * 3) يبحث عن شريط أرقام في كامل الصورة، لا في جهة ثابتة.
- * 4) يصنف المقاطع السبعة ويبحث عن النقطة العشرية.
- * 5) يستخدم ML Kit كخيار احتياطي.
- */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: PreviewView
@@ -58,7 +48,7 @@ class MainActivity : AppCompatActivity() {
 
     private var pendingCandidate: String? = null
     private var stableCount = 0
-    private val requiredStableReads = 3
+    private val requiredStableReads = 2 // تم تقليل عدد القراءات المتطابقة لتسريع الاستجابة
 
     private val cameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -192,17 +182,19 @@ class MainActivity : AppCompatActivity() {
                             return@setAnalyzer
                         }
 
-                        // التحليل السباعي يعمل على كامل الصورة، وليس على قصاصة يمينية ثابتة.
-                        val sevenSegmentMatch = recognizeSevenSegment(bitmap)
-                        val input = InputImage.fromBitmap(bitmap, 0)
                         val bitmapForCleanup = bitmap
+                        val input = InputImage.fromBitmap(bitmap, 0)
 
+                        // الاعتماد الأساسي على ML Kit للتعرف السريع والدقيق على شاشات الميزان والكمبيوتر
                         recognizer.process(input)
                             .addOnSuccessListener { result ->
-                                val match = sevenSegmentMatch ?: extractWeight(result)
-                                runOnUiThread { updateReading(match) }
+                                val mlKitMatch = extractWeight(result)
+                                // إذا لم يجد ML Kit نتيجة واضحة، نحاول باستخدام الخوارزمية البديلة
+                                val finalMatch = mlKitMatch ?: recognizeSevenSegment(bitmapForCleanup)
+                                runOnUiThread { updateReading(finalMatch) }
                             }
                             .addOnFailureListener {
+                                val sevenSegmentMatch = recognizeSevenSegment(bitmapForCleanup)
                                 runOnUiThread { updateReading(sevenSegmentMatch) }
                             }
                             .addOnCompleteListener {
@@ -213,7 +205,7 @@ class MainActivity : AppCompatActivity() {
                                 proxy.close()
                             }
 
-                        bitmap = null // أصبحت ملكية التنظيف لمهمة ML Kit.
+                        bitmap = null 
                     } catch (e: Exception) {
                         bitmap?.let {
                             if (!it.isRecycled) it.recycle()
@@ -236,10 +228,6 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /**
-     * استخراج قناة Y (الإضاءة) من YUV_420_888.
-     * قناة Y صالحة سواء كانت الشاشة مضاءة أو مطفأة، ولا نفترض لوناً أخضر.
-     */
     private fun imageProxyToGrayBitmap(proxy: ImageProxy): Bitmap? {
         val plane = proxy.planes.firstOrNull() ?: return null
         val buffer = plane.buffer.duplicate()
@@ -323,11 +311,6 @@ class MainActivity : AppCompatActivity() {
         val height: Int get() = bottom - top + 1
     }
 
-    /**
-     * يجرب قطبين تكيفيين:
-     * - الأجزاء الداكنة فوق خلفية أفتح (الحالة المعتادة).
-     * - الأجزاء الفاتحة فوق خلفية أغمق (احتياطاً).
-     */
     private fun recognizeSevenSegment(bitmap: Bitmap): String? {
         val width = bitmap.width
         val height = bitmap.height
@@ -350,10 +333,6 @@ class MainActivity : AppCompatActivity() {
         return decodeMask(lightMask, width, height)
     }
 
-    /**
-     * عتبة محلية مبنية على متوسط نافذة حول كل بكسل.
-     * هذا أفضل من Otsu العام عندما توجد ظلال أو انعكاسات أو إضاءة غير متساوية.
-     */
     private fun adaptiveMask(
         gray: IntArray,
         width: Int,
@@ -408,7 +387,6 @@ class MainActivity : AppCompatActivity() {
         width: Int,
         height: Int
     ): String? {
-        // نبحث عن صفوف تحتوي على كمية مناسبة من بكسلات الأرقام.
         val rowCounts = IntArray(height)
         for (y in 0 until height) {
             var count = 0
@@ -434,18 +412,12 @@ class MainActivity : AppCompatActivity() {
 
         for (band in bands) {
             val boxes = findDigitBoxes(mask, width, height, band)
-            if (boxes.size !in 2..8) continue
+            if (boxes.size !in 1..8) continue
 
             val heights = boxes.map { it.height }.sorted()
             val medianHeight = heights[heights.size / 2]
 
-            // استبعاد القطع الصغيرة أو العريضة التي لا تشبه أرقام الميزان.
-            if (medianHeight < 8) continue
-            if (boxes.any {
-                    it.height < medianHeight * 0.48f ||
-                    it.width < medianHeight * 0.10f ||
-                    it.width > medianHeight * 0.95f
-                }) continue
+            if (medianHeight < 6) continue
 
             val digits = mutableListOf<Char>()
             var failed = false
@@ -528,15 +500,15 @@ class MainActivity : AppCompatActivity() {
             columnCounts[x] = count
         }
 
-        val threshold = max(2, (band.height * 0.035f).toInt())
+        val threshold = max(2, (band.height * 0.030f).toInt())
         val runs = findRuns(columnCounts, threshold, maxGap = 1)
 
         val boxes = mutableListOf<DigitBox>()
 
         for ((left, right) in runs) {
             val runWidth = right - left + 1
-            if (runWidth < band.height * 0.10f ||
-                runWidth > band.height * 0.95f
+            if (runWidth < band.height * 0.05f ||
+                runWidth > band.height * 1.2f
             ) continue
 
             var top = height
@@ -561,11 +533,6 @@ class MainActivity : AppCompatActivity() {
         return boxes.sortedBy { it.left }
     }
 
-    /**
-     * ترتيب المقاطع:
-     * 0 أعلى، 1 يمين أعلى، 2 يمين أسفل، 3 أسفل،
-     * 4 يسار أسفل، 5 يسار أعلى، 6 الوسط.
-     */
     private fun classifyDigit(
         mask: BooleanArray,
         imageWidth: Int,
@@ -621,7 +588,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            if (total > 0 && active.toFloat() / total >= 0.28f) {
+            if (total > 0 && active.toFloat() / total >= 0.20f) {
                 bits = bits or (1 shl i)
             }
         }
@@ -630,8 +597,7 @@ class MainActivity : AppCompatActivity() {
             Integer.bitCount(it.key xor bits)
         } ?: return null
 
-        // السماح باختلاف مقطع واحد فقط لتجنب التخمين الخاطئ.
-        if (Integer.bitCount(best.key xor bits) > 1) return null
+        if (Integer.bitCount(best.key xor bits) > 2) return null
         return best.value
     }
 
@@ -652,49 +618,28 @@ class MainActivity : AppCompatActivity() {
 
         val yStart = max(
             band.top,
-            current.top + (current.height * 0.70f).toInt()
+            current.top + (current.height * 0.60f).toInt()
         )
         val yEnd = min(
             height - 1,
-            band.bottom + (current.height * 0.18f).toInt()
+            band.bottom + (current.height * 0.25f).toInt()
         )
 
         var count = 0
-        var minX = width
-        var maxX = -1
-        var minY = height
-        var maxY = -1
-
         for (y in yStart..yEnd) {
             for (x in gapLeft..gapRight) {
                 if (x in 0 until width && mask[y * width + x]) {
                     count++
-                    minX = min(minX, x)
-                    maxX = max(maxX, x)
-                    minY = min(minY, y)
-                    maxY = max(maxY, y)
                 }
             }
         }
 
-        if (count < 2) return false
-
-        val dotWidth = maxX - minX + 1
-        val dotHeight = maxY - minY + 1
-
-        return dotWidth <= current.height * 0.24f &&
-               dotHeight <= current.height * 0.24f &&
-               minY >= current.top + current.height * 0.58f
+        return count >= 1
     }
 
     private fun isValidWeight(value: String): Boolean {
-        if (value.count { it == '.' } != 1) return false
-        if (value.startsWith('.') || value.endsWith('.')) return false
-
-        val parts = value.split('.')
-        if (parts.size != 2) return false
-        if (parts[0].length !in 1..6) return false
-        if (parts[1].length !in 1..3) return false
+        if (value.isEmpty()) return false
+        // السماح بقراءة الأرقام الصحيحة أو العشرية بمرونة كاملة
         return value.toDoubleOrNull() != null
     }
 
@@ -722,23 +667,20 @@ class MainActivity : AppCompatActivity() {
             candidate = null
             pendingCandidate = null
             stableCount = 0
-            detected.text = "— — —"
+            detected.text = — — —
             confirm.isEnabled = false
             status.text = "جارٍ البحث عن أرقام شاشة الميزان..."
         }
     }
 
     /**
-     * OCR احتياطي. يقبل خانة أو خانتين أو ثلاث خانات عشرية.
+     * OCR محسن ومعدل ليتعامل مع أرقام شاشات الموازان وشاشات الكمبيوتر بمرونة عالية.
      */
     private fun extractWeight(result: Text): String? {
-        val pattern = Regex(
-            "(?<![0-9])([0-9]{1,6})[.,٫،]([0-9]{1,3})(?![0-9])"
-        )
+        val cleanResults = mutableListOf<String>()
 
-        val candidates = result.textBlocks
-            .flatMap { it.lines }
-            .mapNotNull { line ->
+        for (block in result.textBlocks) {
+            for (line in block.lines) {
                 val normalized = line.text.map { char ->
                     when (char) {
                         in '٠'..'٩' -> '0' + (char - '٠')
@@ -746,22 +688,16 @@ class MainActivity : AppCompatActivity() {
                         '٫', '،', ',' -> '.'
                         else -> char
                     }
-                }.joinToString("")
-                    .replace(Regex("\\s+"), "")
+                }.joinToString("").replace(Regex("[^0-9.]"), "")
 
-                val match = pattern.find(normalized) ?: return@mapNotNull null
-                val value = "${match.groupValues[1]}.${match.groupValues[2]}"
-
-                if (!isValidWeight(value)) return@mapNotNull null
-
-                val box = line.boundingBox
-                Triple(value, box?.height() ?: 0, box?.width() ?: 0)
+                if (normalized.isNotEmpty() && isValidWeight(normalized)) {
+                    cleanResults.add(normalized)
+                }
             }
+        }
 
-        return candidates.maxWithOrNull(
-            compareBy<Triple<String, Int, Int>> { it.second }
-                .thenBy { it.third }
-        )?.first
+        // إرجاع أطول رقم تم التعرف عليه (عادةً هو قيمة الوزن الكاملة على الشاشة)
+        return cleanResults.maxByOrNull { it.length }
     }
 
     private fun returnValue() {
