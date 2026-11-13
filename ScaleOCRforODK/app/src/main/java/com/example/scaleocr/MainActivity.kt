@@ -4,7 +4,10 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Color
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.graphics.Matrix
 import android.os.Bundle
 import android.view.Gravity
@@ -124,7 +127,6 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         val rotatedBitmap = rotateBitmap(bitmap, 90f)
-                        // استخدام المعالجة الجديدة التي تحول شاشة الميزان إلى تباين حاد (أبيض وأسود)
                         val processedBitmap = preprocessBitmapForScale(rotatedBitmap)
                         val input = InputImage.fromBitmap(processedBitmap, 0)
 
@@ -183,37 +185,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * معالجة بصرية ذكية: تركز على لون شاشة الميزان الأخضر وتحوله إلى خلفية بيضاء ناصعة،
-     * والأرقام الداكنة إلى لون أسود حاد، لتشبه تماماً نصوص إكسل وكمبيوتر!
+     * دالة معالجة شاشات الميزان المضيئة عبر عكس الألوان (Color Inversion)
+     * لتحويل الإضاءة الخضراء الخلفية إلى داكنة وإبراز الأرقام بوضوح لمحرك OCR.
      */
     private fun preprocessBitmapForScale(source: Bitmap): Bitmap {
         val width = source.width
         val height = source.height
-        val scaled = Bitmap.createScaledBitmap(source, width, height, false)
-        val pixels = IntArray(width * height)
-        scaled.getPixels(pixels, 0, width, 0, 0, width, height)
-
-        for (i in pixels.indices) {
-            val p = pixels[i]
-            val r = Color.red(p)
-            val g = Color.green(p)
-            val b = Color.blue(p)
-
-            // فحص إضاءة الشاشة الخضراء المميزة للميزان (الأخضر طاغي على الأحمر والأزرق)
-            // إذا كانت البكسلات تمثل خلفية الشاشة المضيئة، نحولها إلى أبيض (255)
-            // وإذا كانت تمثل الأرقام المظلمة، نحولها إلى أسود تام (0)
-            val isGreenLight = (g > r + 20) && (g > b + 20) && (g > 80)
-
-            pixels[i] = if (isGreenLight) {
-                // فحص دقيق داخل الضوء الأخضر للبحث عن الخطوط الداكنة (الأرقام أو الفاصلة)
-                if (g < 160) Color.BLACK else Color.WHITE
-            } else {
-                Color.WHITE // عزل أي شيء خارج شاشة الميزان ليكون أبيض ناصع
-            }
-        }
-
         val processed = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        processed.setPixels(pixels, 0, width, 0, 0, width, height)
+        val canvas = Canvas(processed)
+        val paint = Paint()
+
+        val colorMatrix = ColorMatrix().apply {
+            set(floatArrayOf(
+                -1.0f,  0f,    0f,    0f, 255f, // عكس اللون الأحمر
+                 0f,   -1.0f,  0f,    0f, 255f, // عكس اللون الأخضر (الخلفية المضيئة تصبح سوداء)
+                 0f,    0f,   -1.0f,  0f, 255f, // عكس اللون الأزرق
+                 0f,    0f,    0f,    1f, 0f    // الحفاظ على الشفافية
+            ))
+        }
+        paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
+        canvas.drawBitmap(source, 0f, 0f, paint)
         return processed
     }
 
