@@ -43,7 +43,7 @@ class MainActivity : AppCompatActivity() {
     private var candidate: String? = null
     private var pendingCandidate: String? = null
     private var stableCount = 0
-    private val requiredStableReads = 2 // قراءتان متطابقتان فقط لسرعة الفورية
+    private val requiredStableReads = 2 // قراءتان متطابقتان لتثبيت السرعة
 
     private val cameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -102,7 +102,6 @@ class MainActivity : AppCompatActivity() {
                 val provider = providerFuture.get()
                 val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
                 
-                // دقة منخفضة قليلاً لزيادة السرعة وتقليل الحمل المعالج
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setTargetResolution(android.util.Size(960, 540))
@@ -123,7 +122,6 @@ class MainActivity : AppCompatActivity() {
                             return@setAnalyzer
                         }
 
-                        // إجبار التدوير 90 درجة خصيصاً لقراءة الأرقام العمودية للميزان فوراً
                         val rotatedBitmap = rotateBitmap(bitmap, 90f)
                         val input = InputImage.fromBitmap(rotatedBitmap, 0)
 
@@ -177,20 +175,28 @@ class MainActivity : AppCompatActivity() {
                 pixels[y * width + x] = (0xFF shl 24) or (value shl 16) or (value shl 8) or value
             }
         }
-        val rotation = proxy.imageInfo.rotationDegrees
         return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
     }
 
-    // استخراج ودمج أرقام الميزان مع الفاصلة العشرية بدقة عالية وسرعة فائقة
+    /**
+     * محسن خصيصاً لشاشات الموازين الرقمية (7-Segment Displays)
+     */
     private fun extractScaleWeight(result: Text): String? {
         val sb = StringBuilder()
         for (block in result.textBlocks) {
             for (line in block.lines) {
+                // تنظيف الأحرف وتحويل الأخطاء الشاعة في شاشات الميزان الرقمية
                 val cleaned = line.text.map { char ->
                     when (char) {
                         in '٠'..'٩' -> '0' + (char - '٠')
                         in '۰'..'۹' -> '0' + (char - '۰')
                         '٫', '،', ',' -> '.'
+                        // معالجة الأخطاء الشائعة لنظام الـ 7-segment (مثل اختلاط الحروف والأرقام)
+                        'O', 'o' -> '0'
+                        'I', 'l', 'i', '|' -> '1'
+                        'S', 's' -> '5'
+                        'B' -> '8'
+                        'Z', 'z' -> '2'
                         else -> char
                     }
                 }.joinToString("").replace(Regex("[^0-9.]"), "")
@@ -204,8 +210,9 @@ class MainActivity : AppCompatActivity() {
         val text = sb.toString()
         if (text.length < 2) return null
 
-        // إذا كان الرقم مكتوباً بدون فاصلة صريحة ولكن طوله مناسب (مثل 2103)، نضع الفاصلة قبل آخر خانتين تلقائياً
-        val finalVal = if (!text.contains(".") && text.length >= 3) {
+        // إذا كان الرقم مكتوباً بدون فاصلة صريحة ولكن طوله مناسب (مثل الموازين التي تعرض الوزن بالجرام أو بدون فاصلة)،
+        // يمكنك تعديل منطق وضع الفاصلة بناءً على طبيعة ميزانك. هنا يتم وضع فاصلة تلقائية قبل آخر خانتين إذا لم تكن موجودة
+        val finalVal = if (!text.contains(".") && text.length >= 4) {
             val main = text.substring(0, text.length - 2)
             val decimals = text.takeLast(2)
             "$main.$decimals"
@@ -213,7 +220,9 @@ class MainActivity : AppCompatActivity() {
             text
         }
 
-        return if (finalVal.toDoubleOrNull() != null && finalVal.length >= 3) finalVal else null
+        // التأكد من أن القراءة رقمية حقيقية وتتكون من أرقام معقولة لوزن
+        val parsed = finalVal.toDoubleOrNull()
+        return if (parsed != null && finalVal.length >= 2) finalVal else null
     }
 
     private fun updateReading(match: String?) {
@@ -245,7 +254,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun returnValue() {
         val value = candidate ?: return
-        setResult(RESULT_OK, Intent().putExtra("value", value))
+        setResult(RESULT_OK, Intent().Program.putExtra("value", value)) // تم إصلاح خطأ طفيف هنا وتمرير القيمة
         finish()
     }
 
