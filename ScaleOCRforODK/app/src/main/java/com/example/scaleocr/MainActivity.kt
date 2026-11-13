@@ -184,6 +184,10 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
     }
 
+    /**
+     * دالة معالجة شاشات الميزان المضيئة عبر عكس الألوان (Color Inversion)
+     * لتحويل الإضاءة الخضراء الخلفية إلى داكنة وإبراز الأرقام بوضوح لمحرك OCR.
+     */
     private fun preprocessBitmapForScale(source: Bitmap): Bitmap {
         val width = source.width
         val height = source.height
@@ -193,10 +197,10 @@ class MainActivity : AppCompatActivity() {
 
         val colorMatrix = ColorMatrix().apply {
             set(floatArrayOf(
-                2.0f, 0f, 0f, 0f, -50f,
-                0f, 2.0f, 0f, 0f, -50f,
-                0f, 0f, 2.0f, 0f, -50f,
-                0f, 0f, 0f, 1f, 0f
+                -1.0f,  0f,    0f,    0f, 255f, // عكس اللون الأحمر
+                 0f,   -1.0f,  0f,    0f, 255f, // عكس اللون الأخضر (الخلفية المضيئة تصبح سوداء)
+                 0f,    0f,   -1.0f,  0f, 255f, // عكس اللون الأزرق
+                 0f,    0f,    0f,    1f, 0f    // الحفاظ على الشفافية
             ))
         }
         paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
