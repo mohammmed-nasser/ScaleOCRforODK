@@ -4,7 +4,10 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Color
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.graphics.Matrix
 import android.os.Bundle
 import android.view.Gravity
@@ -67,13 +70,13 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_HORIZONTAL
         }
 
-        val heading = TextView(this).apply { text = "التقاط وزن الميزان"; textSize = 23f; gravity = Gravity.CENTER }
+        val heading = TextView(this).apply { text = "قراءة وزن الميزان"; textSize = 23f; gravity = Gravity.CENTER }
         previewView = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
-        status = TextView(this).apply { text = "اجعل شاشة الميزان وحدها داخل الإطار ثم اضغط التقاط"; textSize = 15f; gravity = Gravity.CENTER; setPadding(0, 14, 0, 8) }
+        status = TextView(this).apply { text = "وجّه شاشة الميزان بوضوح ثم اضغط التقاط"; textSize = 16f; gravity = Gravity.CENTER; setPadding(0, 14, 0, 8) }
         detected = TextView(this).apply { text = "---"; textSize = 34f; gravity = Gravity.CENTER; setPadding(0, 8, 0, 14) }
 
         captureButton = Button(this).apply {
-            text = "📷 التقاط صورة الميزان"
+            text = "📷 التقاط صورة وقراءة الوزن"
             setOnClickListener { takePhoto() }
         }
 
@@ -131,8 +134,8 @@ class MainActivity : AppCompatActivity() {
                     if (bitmap != null) {
                         val rotatedBitmap = rotateBitmap(bitmap, 90f)
                         val processedBitmap = preprocessBitmapForScale(rotatedBitmap)
-                        
                         val input = InputImage.fromBitmap(processedBitmap, 0)
+
                         recognizer.process(input)
                             .addOnSuccessListener { result ->
                                 val match = extractScaleWeight(result)
@@ -141,23 +144,21 @@ class MainActivity : AppCompatActivity() {
                             .addOnFailureListener {
                                 runOnUiThread { handleCapturedResult(null) }
                             }
+                            .addOnCompleteListener {
+                                if (!rotatedBitmap.isRecycled) rotatedBitmap.recycle()
+                                if (!processedBitmap.isRecycled) processedBitmap.recycle()
+                            }
                     } else {
-                        runOnUiThread {
-                            status.text = "فشل معالجة الصورة، حاول مرة أخرى."
-                        }
+                        runOnUiThread { status.text = "فشل معالجة الصورة، حاول مجدداً." }
                     }
                 } catch (e: Exception) {
                     proxy.close()
-                    runOnUiThread {
-                        status.text = "حدث خطأ: ${e.localizedMessage}"
-                    }
+                    runOnUiThread { status.text = "حدث خطأ: ${e.localizedMessage}" }
                 }
             }
 
             override fun onError(exception: ImageCaptureException) {
-                runOnUiThread {
-                    status.text = "فشل الالتقاط: ${exception.localizedMessage}"
-                }
+                runOnUiThread { status.text = "فشل الالتقاط: ${exception.localizedMessage}" }
             }
         })
     }
@@ -170,18 +171,17 @@ class MainActivity : AppCompatActivity() {
     private fun imageProxyToBitmap(proxy: ImageProxy): Bitmap? {
         val plane = proxy.planes.firstOrNull() ?: return null
         val buffer = plane.buffer.duplicate()
-        val width = proxy.width
-        val height = proxy.height
+        val crop = proxy.cropRect
+        val width = crop.width()
+        val height = crop.height()
         if (width < 20 || height < 20) return null
 
         val pixels = IntArray(width * height)
         for (y in 0 until height) {
             for (x in 0 until width) {
-                val index = y * plane.rowStride + x * plane.pixelStride
-                if (index < buffer.limit()) {
-                    val value = buffer.get(index).toInt() and 0xFF
-                    pixels[y * width + x] = (0xFF shl 24) or (value shl 16) or (value shl 8) or value
-                }
+                val index = (y + crop.top) * plane.rowStride + (x + crop.left) * plane.pixelStride
+                val value = buffer.get(index).toInt() and 0xFF
+                pixels[y * width + x] = (0xFF shl 24) or (value shl 16) or (value shl 8) or value
             }
         }
         return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
@@ -190,27 +190,20 @@ class MainActivity : AppCompatActivity() {
     private fun preprocessBitmapForScale(source: Bitmap): Bitmap {
         val width = source.width
         val height = source.height
-        val scaled = Bitmap.createScaledBitmap(source, width, height, false)
-        val pixels = IntArray(width * height)
-        scaled.getPixels(pixels, 0, width, 0, 0, width, height)
-
-        for (i in pixels.indices) {
-            val p = pixels[i]
-            val r = Color.red(p)
-            val g = Color.green(p)
-            val b = Color.blue(p)
-
-            // عزل شاشة الميزان الخضراء والتركيز على الأرقام الداكنة داخلها
-            val isGreenLight = (g > r + 15) && (g > b + 15) && (g > 70)
-            pixels[i] = if (isGreenLight) {
-                if (g < 150) Color.BLACK else Color.WHITE
-            } else {
-                Color.WHITE
-            }
-        }
-
         val processed = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        processed.setPixels(pixels, 0, width, 0, 0, width, height)
+        val canvas = Canvas(processed)
+        val paint = Paint()
+
+        val colorMatrix = ColorMatrix().apply {
+            set(floatArrayOf(
+                -1.0f,  0f,    0f,    0f, 255f, 
+                 0f,   -1.0f,  0f,    0f, 255f, 
+                 0f,    0f,   -1.0f,  0f, 255f, 
+                 0f,    0f,    0f,    1f, 0f    
+            ))
+        }
+        paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
+        canvas.drawBitmap(source, 0f, 0f, paint)
         return processed
     }
 
@@ -251,15 +244,15 @@ class MainActivity : AppCompatActivity() {
         if (match != null) {
             capturedValue = match
             detected.text = match
-            status.text = "تمت قراءة الوزن بنجاح! اضغط تأكيد أو اعتد الالتقاط"
+            status.text = "تمت قراءة الوزن بنجاح! اضغط تأكيد."
             confirmButton.isEnabled = true
             captureButton.text = "🔄 إعادة التقاط الصورة"
         } else {
             capturedValue = null
             detected.text = "---"
             confirmButton.isEnabled = false
-            captureButton.text = "📷 التقاط صورة الميزان"
-            status.text = "تعذر قراءة الرقم بوضوح، قرب الكاميرا وحاول مجدداً."
+            captureButton.text = "📷 التقاط صورة وقراءة الوزن"
+            status.text = "تعذر قراءة الرقم، قرب الكاميرا وحاول مجدداً."
         }
     }
 
