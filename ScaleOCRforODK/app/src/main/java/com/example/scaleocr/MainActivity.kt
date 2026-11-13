@@ -18,8 +18,7 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -31,20 +30,24 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: PreviewView
     private lateinit var status: TextView
     private lateinit var detected: TextView
-    private lateinit var captureButton: Button
-    private lateinit var confirmButton: Button
+    private lateinit var confirm: Button
     private lateinit var cameraExecutor: ExecutorService
 
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    private var imageCapture: ImageCapture? = null
+    private val processing = AtomicBoolean(false)
 
-    private var capturedValue: String? = null
+    @Volatile
+    private var candidate: String? = null
+    private var pendingCandidate: String? = null
+    private var stableCount = 0
+    private val requiredStableReads = 2
 
     private val cameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -72,15 +75,10 @@ class MainActivity : AppCompatActivity() {
 
         val heading = TextView(this).apply { text = "قراءة وزن الميزان"; textSize = 23f; gravity = Gravity.CENTER }
         previewView = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
-        status = TextView(this).apply { text = "وجّه شاشة الميزان بوضوح ثم اضغط التقاط"; textSize = 16f; gravity = Gravity.CENTER; setPadding(0, 14, 0, 8) }
+        status = TextView(this).apply { text = "وجّه شاشة الميزان بوضوح داخل الإطار"; textSize = 16f; gravity = Gravity.CENTER; setPadding(0, 14, 0, 8) }
         detected = TextView(this).apply { text = "---"; textSize = 34f; gravity = Gravity.CENTER; setPadding(0, 8, 0, 14) }
 
-        captureButton = Button(this).apply {
-            text = "📷 التقاط صورة وقراءة الوزن"
-            setOnClickListener { takePhoto() }
-        }
-
-        confirmButton = Button(this).apply {
+        confirm = Button(this).apply {
             text = "تأكيد وإرسال إلى ODK"
             isEnabled = false
             setOnClickListener { returnValue() }
@@ -95,8 +93,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(previewView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(status)
         root.addView(detected)
-        root.addView(captureButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(confirmButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(confirm, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(cancel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         setContentView(root)
@@ -109,29 +106,26 @@ class MainActivity : AppCompatActivity() {
                 val provider = providerFuture.get()
                 val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
                 
-                imageCapture = ImageCapture.Builder()
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                val analysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setTargetResolution(android.util.Size(960, 540))
                     .build()
 
-                provider.unbindAll()
-                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
-            } catch (e: Exception) {
-                status.text = "تعذر تشغيل الكاميرا: ${e.localizedMessage}"
-            }
-        }, ContextCompat.getMainExecutor(this))
-    }
+                analysis.setAnalyzer(cameraExecutor) { proxy ->
+                    if (!processing.compareAndSet(false, true)) {
+                        proxy.close()
+                        return@setAnalyzer
+                    }
 
-    private fun takePhoto() {
-        val capture = imageCapture ?: return
-        status.text = "جاري التقاط الصورة وتحليلها..."
+                    var bitmap: Bitmap? = null
+                    try {
+                        bitmap = imageProxyToBitmap(proxy)
+                        if (bitmap == null) {
+                            processing.set(false)
+                            proxy.close()
+                            return@setAnalyzer
+                        }
 
-        capture.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
-            override fun onCaptureSuccess(proxy: ImageProxy) {
-                try {
-                    val bitmap = imageProxyToBitmap(proxy)
-                    proxy.close()
-
-                    if (bitmap != null) {
                         val rotatedBitmap = rotateBitmap(bitmap, 90f)
                         val processedBitmap = preprocessBitmapForScale(rotatedBitmap)
                         val input = InputImage.fromBitmap(processedBitmap, 0)
@@ -139,28 +133,31 @@ class MainActivity : AppCompatActivity() {
                         recognizer.process(input)
                             .addOnSuccessListener { result ->
                                 val match = extractScaleWeight(result)
-                                runOnUiThread { handleCapturedResult(match) }
+                                runOnUiThread { updateReading(match) }
                             }
                             .addOnFailureListener {
-                                runOnUiThread { handleCapturedResult(null) }
+                                runOnUiThread { updateReading(null) }
                             }
                             .addOnCompleteListener {
+                                if (!bitmap.isRecycled) bitmap.recycle()
                                 if (!rotatedBitmap.isRecycled) rotatedBitmap.recycle()
                                 if (!processedBitmap.isRecycled) processedBitmap.recycle()
+                                processing.set(false)
+                                proxy.close()
                             }
-                    } else {
-                        runOnUiThread { status.text = "فشل معالجة الصورة، حاول مجدداً." }
+                    } catch (e: Exception) {
+                        bitmap?.let { if (!it.isRecycled) it.recycle() }
+                        processing.set(false)
+                        proxy.close()
                     }
-                } catch (e: Exception) {
-                    proxy.close()
-                    runOnUiThread { status.text = "حدث خطأ: ${e.localizedMessage}" }
                 }
-            }
 
-            override fun onError(exception: ImageCaptureException) {
-                runOnUiThread { status.text = "فشل الالتقاط: ${exception.localizedMessage}" }
+                provider.unbindAll()
+                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+            } catch (e: Exception) {
+                status.text = "تعذر تشغيل الكاميرا: ${e.localizedMessage}"
             }
-        })
+        }, ContextCompat.getMainExecutor(this))
     }
 
     private fun rotateBitmap(source: Bitmap, angle: Float): Bitmap {
@@ -187,6 +184,10 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
     }
 
+    /**
+     * دالة معالجة شاشات الميزان المضيئة عبر عكس الألوان (Color Inversion)
+     * لتحويل الإضاءة الخضراء الخلفية إلى داكنة وإبراز الأرقام بوضوح لمحرك OCR.
+     */
     private fun preprocessBitmapForScale(source: Bitmap): Bitmap {
         val width = source.width
         val height = source.height
@@ -196,10 +197,10 @@ class MainActivity : AppCompatActivity() {
 
         val colorMatrix = ColorMatrix().apply {
             set(floatArrayOf(
-                -1.0f,  0f,    0f,    0f, 255f, 
-                 0f,   -1.0f,  0f,    0f, 255f, 
-                 0f,    0f,   -1.0f,  0f, 255f, 
-                 0f,    0f,    0f,    1f, 0f    
+                -1.0f,  0f,    0f,    0f, 255f, // عكس اللون الأحمر
+                 0f,   -1.0f,  0f,    0f, 255f, // عكس اللون الأخضر (الخلفية المضيئة تصبح سوداء)
+                 0f,    0f,   -1.0f,  0f, 255f, // عكس اللون الأزرق
+                 0f,    0f,    0f,    1f, 0f    // الحفاظ على الشفافية
             ))
         }
         paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
@@ -237,27 +238,39 @@ class MainActivity : AppCompatActivity() {
 
         val text = sb.toString()
         if (text.length < 2) return null
+
         return if (text.toDoubleOrNull() != null && text.length >= 2) text else null
     }
 
-    private fun handleCapturedResult(match: String?) {
+    private fun updateReading(match: String?) {
         if (match != null) {
-            capturedValue = match
+            if (match == pendingCandidate) {
+                stableCount++
+            } else {
+                pendingCandidate = match
+                stableCount = 1
+            }
             detected.text = match
-            status.text = "تمت قراءة الوزن بنجاح! اضغط تأكيد."
-            confirmButton.isEnabled = true
-            captureButton.text = "🔄 إعادة التقاط الصورة"
+
+            if (stableCount >= requiredStableReads) {
+                candidate = match
+                status.text = "تم تثبيت القراءة. اضغط تأكيد."
+                confirm.isEnabled = true
+            } else {
+                status.text = "جارٍ التأكد... $stableCount/$requiredStableReads"
+            }
         } else {
-            capturedValue = null
+            candidate = null
+            pendingCandidate = null
+            stableCount = 0
             detected.text = "---"
-            confirmButton.isEnabled = false
-            captureButton.text = "📷 التقاط صورة وقراءة الوزن"
-            status.text = "تعذر قراءة الرقم، قرب الكاميرا وحاول مجدداً."
+            confirm.isEnabled = false
+            status.text = "جارٍ البحث عن شاشة الميزان..."
         }
     }
 
     private fun returnValue() {
-        val value = capturedValue ?: return
+        val value = candidate ?: return
         setResult(RESULT_OK, Intent().putExtra("value", value))
         finish()
     }
