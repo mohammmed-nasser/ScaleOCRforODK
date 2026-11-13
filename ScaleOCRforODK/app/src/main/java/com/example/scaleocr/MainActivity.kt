@@ -43,7 +43,7 @@ class MainActivity : AppCompatActivity() {
     private var candidate: String? = null
     private var pendingCandidate: String? = null
     private var stableCount = 0
-    private val requiredStableReads = 2 // قراءتان متطابقتان لتثبيت السرعة
+    private val requiredStableReads = 2 // قراءتان متطابقتان لتثبيت القراءة فوراً
 
     private val cameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -71,7 +71,7 @@ class MainActivity : AppCompatActivity() {
 
         val heading = TextView(this).apply { text = "قراءة وزن الميزان"; textSize = 23f; gravity = Gravity.CENTER }
         previewView = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
-        status = TextView(this).apply { text = "وجّه الكاميرا نحو شاشة الميزان"; textSize = 16f; gravity = Gravity.CENTER; setPadding(0, 14, 0, 8) }
+        status = TextView(this).apply { text = "وجّه الشاشة الرقمية وحدها داخل الإطار"; textSize = 16f; gravity = Gravity.CENTER; setPadding(0, 14, 0, 8) }
         detected = TextView(this).apply { text = "---"; textSize = 34f; gravity = Gravity.CENTER; setPadding(0, 8, 0, 14) }
 
         confirm = Button(this).apply {
@@ -179,24 +179,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * محسن خصيصاً لشاشات الموازين الرقمية (7-Segment Displays)
+     * استخراج الأرقام مباشرة باعتبار أن الشاشة وحدها الظاهرة (أرقام نوع 7-Segment)
      */
     private fun extractScaleWeight(result: Text): String? {
         val sb = StringBuilder()
         for (block in result.textBlocks) {
             for (line in block.lines) {
-                // تنظيف الأحرف وتحويل الأخطاء الشاعة في شاشات الميزان الرقمية
+                // تحويل كل الرموز المشابهة أو الأرقام العربية إلى إنجليزية، واعتبار أي حرف قارب رقم 7-segment رقماً صحيحاً
                 val cleaned = line.text.map { char ->
                     when (char) {
                         in '٠'..'٩' -> '0' + (char - '٠')
                         in '۰'..'۹' -> '0' + (char - '۰')
                         '٫', '،', ',' -> '.'
-                        // معالجة الأخطاء الشائعة لنظام الـ 7-segment (مثل اختلاط الحروف والأرقام)
-                        'O', 'o' -> '0'
-                        'I', 'l', 'i', '|' -> '1'
-                        'S', 's' -> '5'
-                        'B' -> '8'
+                        // تصحيح الأخطاء الشائعة لشاشات الساعات الرقمية والموازين
+                        'O', 'o', 'Q', 'D' -> '0'
+                        'I', 'l', 'i', '|', '!','T' -> '1'
                         'Z', 'z' -> '2'
+                        'E' -> '3'
+                        'A' -> '4'
+                        'S', 's' -> '5'
+                        'G', 'b' -> '6'
+                        'B' -> '8'
+                        'g', 'q' -> '9'
                         else -> char
                     }
                 }.joinToString("").replace(Regex("[^0-9.]"), "")
@@ -210,8 +214,8 @@ class MainActivity : AppCompatActivity() {
         val text = sb.toString()
         if (text.length < 2) return null
 
-        // إذا كان الرقم مكتوباً بدون فاصلة صريحة ولكن طوله مناسب (مثل الموازين التي تعرض الوزن بالجرام أو بدون فاصلة)،
-        // يمكنك تعديل منطق وضع الفاصلة بناءً على طبيعة ميزانك. هنا يتم وضع فاصلة تلقائية قبل آخر خانتين إذا لم تكن موجودة
+        // إذا كانت الشاشة تعرض الأرقام بدون فاصلة عشرية صريحة (مثل وزن بالجرام أو قراءة مباشرة)،
+        // يمكنك ضبط موضع الفاصلة التلقائي هنا (مثلاً وضعها قبل آخر خانتين)
         val finalVal = if (!text.contains(".") && text.length >= 4) {
             val main = text.substring(0, text.length - 2)
             val decimals = text.takeLast(2)
@@ -220,9 +224,7 @@ class MainActivity : AppCompatActivity() {
             text
         }
 
-        // التأكد من أن القراءة رقمية حقيقية وتتكون من أرقام معقولة لوزن
-        val parsed = finalVal.toDoubleOrNull()
-        return if (parsed != null && finalVal.length >= 2) finalVal else null
+        return if (finalVal.toDoubleOrNull() != null && finalVal.length >= 2) finalVal else null
     }
 
     private fun updateReading(match: String?) {
@@ -248,13 +250,14 @@ class MainActivity : AppCompatActivity() {
             stableCount = 0
             detected.text = "---"
             confirm.isEnabled = false
-            status.text = "جارٍ البحث عن شاشة الميزان..."
+            status.text = "جارٍ البحث عن الأرقام..."
         }
     }
 
     private fun returnValue() {
         val value = candidate ?: return
-        setResult(RESULT_OK, Intent().Program.putExtra("value", value)) // تم إصلاح خطأ طفيف هنا وتمرير القيمة
+        // تم تصحيح الخطأ البرمجي هنا وإزالة Program الخاطئة
+        setResult(RESULT_OK, Intent().putExtra("value", value))
         finish()
     }
 
