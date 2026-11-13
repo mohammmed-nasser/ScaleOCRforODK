@@ -127,9 +127,7 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         val rotatedBitmap = rotateBitmap(bitmap, 90f)
-                        // تطبيق المعالجة المخصصة لشاشات الميزان المضيئة (إبراز الأرقام وتصفية الخلفية الخضراء الساطعة)
                         val processedBitmap = preprocessBitmapForScale(rotatedBitmap)
-
                         val input = InputImage.fromBitmap(processedBitmap, 0)
 
                         recognizer.process(input)
@@ -186,9 +184,6 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
     }
 
-    /**
-     * معالجة بصرية لزيادة تباين الشاشة المضيئة وإبراز الأرقام بوضوح لمحرك OCR
-     */
     private fun preprocessBitmapForScale(source: Bitmap): Bitmap {
         val width = source.width
         val height = source.height
@@ -196,7 +191,6 @@ class MainActivity : AppCompatActivity() {
         val canvas = Canvas(processed)
         val paint = Paint()
 
-        // مصفوفة ألوان لزيادة التشبع والتباين ورفع إضاءة الأرقام السوداء مقارنة بالخلفية المضيئة
         val colorMatrix = ColorMatrix().apply {
             set(floatArrayOf(
                 2.0f, 0f, 0f, 0f, -50f,
@@ -210,9 +204,6 @@ class MainActivity : AppCompatActivity() {
         return processed
     }
 
-    /**
-     * استخراج الأرقام والفاصلة العشرية بدقة من شاشة الميزان
-     */
     private fun extractScaleWeight(result: Text): String? {
         val sb = StringBuilder()
         for (block in result.textBlocks) {
@@ -244,7 +235,6 @@ class MainActivity : AppCompatActivity() {
         val text = sb.toString()
         if (text.length < 2) return null
 
-        // التأكد من وجود الفاصلة العشرية أو معالجة شكل الرقم كقيمة صحيحة عشرية
         return if (text.toDoubleOrNull() != null && text.length >= 2) text else null
     }
 
@@ -258,4 +248,32 @@ class MainActivity : AppCompatActivity() {
             }
             detected.text = match
 
-….
+            if (stableCount >= requiredStableReads) {
+                candidate = match
+                status.text = "تم تثبيت القراءة. اضغط تأكيد."
+                confirm.isEnabled = true
+            } else {
+                status.text = "جارٍ التأكد... $stableCount/$requiredStableReads"
+            }
+        } else {
+            candidate = null
+            pendingCandidate = null
+            stableCount = 0
+            detected.text = "---"
+            confirm.isEnabled = false
+            status.text = "جارٍ البحث عن شاشة الميزان..."
+        }
+    }
+
+    private fun returnValue() {
+        val value = candidate ?: return
+        setResult(RESULT_OK, Intent().putExtra("value", value))
+        finish()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
+        recognizer.close()
+    }
+}
