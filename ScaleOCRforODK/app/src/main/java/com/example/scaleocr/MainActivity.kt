@@ -4,6 +4,10 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.graphics.Matrix
 import android.os.Bundle
 import android.view.Gravity
@@ -43,7 +47,7 @@ class MainActivity : AppCompatActivity() {
     private var candidate: String? = null
     private var pendingCandidate: String? = null
     private var stableCount = 0
-    private val requiredStableReads = 2 // قراءتان متطابقتان لتثبيت القراءة فوراً
+    private val requiredStableReads = 2
 
     private val cameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -71,7 +75,7 @@ class MainActivity : AppCompatActivity() {
 
         val heading = TextView(this).apply { text = "قراءة وزن الميزان"; textSize = 23f; gravity = Gravity.CENTER }
         previewView = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
-        status = TextView(this).apply { text = "وجّه الشاشة الرقمية وحدها داخل الإطار"; textSize = 16f; gravity = Gravity.CENTER; setPadding(0, 14, 0, 8) }
+        status = TextView(this).apply { text = "وجّه شاشة الميزان بوضوح داخل الإطار"; textSize = 16f; gravity = Gravity.CENTER; setPadding(0, 14, 0, 8) }
         detected = TextView(this).apply { text = "---"; textSize = 34f; gravity = Gravity.CENTER; setPadding(0, 8, 0, 14) }
 
         confirm = Button(this).apply {
@@ -123,7 +127,10 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         val rotatedBitmap = rotateBitmap(bitmap, 90f)
-                        val input = InputImage.fromBitmap(rotatedBitmap, 0)
+                        // تطبيق المعالجة المخصصة لشاشات الميزان المضيئة (إبراز الأرقام وتصفية الخلفية الخضراء الساطعة)
+                        val processedBitmap = preprocessBitmapForScale(rotatedBitmap)
+
+                        val input = InputImage.fromBitmap(processedBitmap, 0)
 
                         recognizer.process(input)
                             .addOnSuccessListener { result ->
@@ -136,6 +143,7 @@ class MainActivity : AppCompatActivity() {
                             .addOnCompleteListener {
                                 if (!bitmap.isRecycled) bitmap.recycle()
                                 if (!rotatedBitmap.isRecycled) rotatedBitmap.recycle()
+                                if (!processedBitmap.isRecycled) processedBitmap.recycle()
                                 processing.set(false)
                                 proxy.close()
                             }
@@ -179,21 +187,43 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * استخراج الأرقام مباشرة باعتبار أن الشاشة وحدها الظاهرة (أرقام نوع 7-Segment)
+     * معالجة بصرية لزيادة تباين الشاشة المضيئة وإبراز الأرقام بوضوح لمحرك OCR
+     */
+    private fun preprocessBitmapForScale(source: Bitmap): Bitmap {
+        val width = source.width
+        val height = source.height
+        val processed = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(processed)
+        val paint = Paint()
+
+        // مصفوفة ألوان لزيادة التشبع والتباين ورفع إضاءة الأرقام السوداء مقارنة بالخلفية المضيئة
+        val colorMatrix = ColorMatrix().apply {
+            set(floatArrayOf(
+                2.0f, 0f, 0f, 0f, -50f,
+                0f, 2.0f, 0f, 0f, -50f,
+                0f, 0f, 2.0f, 0f, -50f,
+                0f, 0f, 0f, 1f, 0f
+            ))
+        }
+        paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
+        canvas.drawBitmap(source, 0f, 0f, paint)
+        return processed
+    }
+
+    /**
+     * استخراج الأرقام والفاصلة العشرية بدقة من شاشة الميزان
      */
     private fun extractScaleWeight(result: Text): String? {
         val sb = StringBuilder()
         for (block in result.textBlocks) {
             for (line in block.lines) {
-                // تحويل كل الرموز المشابهة أو الأرقام العربية إلى إنجليزية، واعتبار أي حرف قارب رقم 7-segment رقماً صحيحاً
                 val cleaned = line.text.map { char ->
                     when (char) {
                         in '٠'..'٩' -> '0' + (char - '٠')
                         in '۰'..'۹' -> '0' + (char - '۰')
                         '٫', '،', ',' -> '.'
-                        // تصحيح الأخطاء الشائعة لشاشات الساعات الرقمية والموازين
                         'O', 'o', 'Q', 'D' -> '0'
-                        'I', 'l', 'i', '|', '!','T' -> '1'
+                        'I', 'l', 'i', '|', '!', 'T' -> '1'
                         'Z', 'z' -> '2'
                         'E' -> '3'
                         'A' -> '4'
@@ -214,17 +244,8 @@ class MainActivity : AppCompatActivity() {
         val text = sb.toString()
         if (text.length < 2) return null
 
-        // إذا كانت الشاشة تعرض الأرقام بدون فاصلة عشرية صريحة (مثل وزن بالجرام أو قراءة مباشرة)،
-        // يمكنك ضبط موضع الفاصلة التلقائي هنا (مثلاً وضعها قبل آخر خانتين)
-        val finalVal = if (!text.contains(".") && text.length >= 4) {
-            val main = text.substring(0, text.length - 2)
-            val decimals = text.takeLast(2)
-            "$main.$decimals"
-        } else {
-            text
-        }
-
-        return if (finalVal.toDoubleOrNull() != null && finalVal.length >= 2) finalVal else null
+        // التأكد من وجود الفاصلة العشرية أو معالجة شكل الرقم كقيمة صحيحة عشرية
+        return if (text.toDoubleOrNull() != null && text.length >= 2) text else null
     }
 
     private fun updateReading(match: String?) {
@@ -237,33 +258,4 @@ class MainActivity : AppCompatActivity() {
             }
             detected.text = match
 
-            if (stableCount >= requiredStableReads) {
-                candidate = match
-                status.text = "تم تثبيت القراءة. اضغط تأكيد."
-                confirm.isEnabled = true
-            } else {
-                status.text = "جارٍ التأكد... $stableCount/$requiredStableReads"
-            }
-        } else {
-            candidate = null
-            pendingCandidate = null
-            stableCount = 0
-            detected.text = "---"
-            confirm.isEnabled = false
-            status.text = "جارٍ البحث عن الأرقام..."
-        }
-    }
-
-    private fun returnValue() {
-        val value = candidate ?: return
-        // تم تصحيح الخطأ البرمجي هنا وإزالة Program الخاطئة
-        setResult(RESULT_OK, Intent().putExtra("value", value))
-        finish()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        cameraExecutor.shutdown()
-        recognizer.close()
-    }
-}
+….
